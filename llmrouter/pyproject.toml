@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmrouter"
+version = "0.1.0"
+description = "Cache-aware LLM routing: picks the (model, backend) pair, keeps sessions sticky, and chooses prompt-cache TTL per breakpoint."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "llmrouter contributors" }]
+keywords = ["llm", "routing", "prompt-caching", "cost-optimization", "kv-cache"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The decision engine has ZERO mandatory dependencies. This is deliberate:
+# it is pure and importable anywhere, including edge/serverless cold paths.
+dependencies = []
+
+[project.optional-dependencies]
+http = ["httpx>=0.27"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/example/llmrouter"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+llmrouter = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

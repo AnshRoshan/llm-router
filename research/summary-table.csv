@@ -1,0 +1,22 @@
+technique,mechanism,latency,reported_cost_reduction,quality,training_data_needed,n_models,implementation_difficulty,production_readiness,best_reference
+Rule / metadata,"keyword, regex, length, modality, tenant, role",<1 ms,n/a (enabler),ceiling = rule quality,None,any,Very low,5,vLLM-SR signal layer; LiteLLM pre-call checks
+Cost-aware selection,cheapest model meeting constraints,<1 ms,30-60% (naive),Unmodeled (no quality signal),None (needs price table),any,Very low,5,LiteLLM cost-based-routing
+Embedding similarity,cosine to route utterances + threshold,5-20 ms,varies by domain split,34.85% -> 89.39% after fit(),5-15 utterances per route,any,Low,4,aurelio-labs/semantic-router
+Clustering (training-free),k-means cluster -> per-cluster capability profile,embedding pass,27-31.7% at matched acc; +7.1% acc over GPT-5-medium,matches or beats best single model,validation set only (no training),any,Low-Medium,4,Avengers-Pro (AAAI 2026)
+Matrix factorization,MF on preference data -> win rate,low,85% MT-Bench at 95% GPT-4 (2-3.66x defensible),95% GPT-4 on MT-Bench; 47% on RouterArena 2026,preference pairs,2 (original),Medium,3,RouteLLM mf
+BERT / ModernBERT classifier,fine-tuned encoder -> difficulty or model score,10-100 ms,45% MMLU; -48.5% tokens (reasoning gate),98.53% routing accuracy with 805 examples,labeled outcomes,any,Medium-High,4,"vLLM-SR (LoRA, ONNX)"
+Random forest on embeddings,RF over query embedding,100-150 ms hosted,12.5% vs Sonnet; 20-40% (vendor),beats RouteLLM on MMLU/BBH (vendor claim),scored pairs (>=15),2,Low-Medium,4,Not-Diamond/RoRF
+KNN router,best model among k nearest training queries,low,RouterArena: $300/1K queries (expensive),69% acc / worst cost,outcome matrix,any,Low,2,RouterBench baseline
+MLP router,regression on query features,low,RouterArena: $287/1K queries (expensive),65% acc,outcome matrix,any,Low,2,RouterBench baseline
+IRT-Router,item response theory: ability x difficulty x discrimination,~27 ms,can hit 5x optimal cost,RouterArena rank #3,outcome matrix,any,High,3,IRT-Router (ACL 2025)
+Graph (GNN) router,heterogeneous graph edge prediction,graph pass,-99% new-model onboarding time cost,>=88.89% of oracle; zero-shot to new LLMs,interaction data,any,High,3,GraphRouter (ICLR 2025)
+Dual contrastive (RouterDC),shared query<->LLM embedding space,~10 ms,best cost-ratio score,worst accuracy (32%),pairs,any,High,2,RouterDC
+Cascade + confidence,cheap model -> score output -> escalate,+1 model turn on escalation,50-98% (FrugalGPT); 31% real production,ECE 0.03 after calibration,labelled calibration split,2-K,Medium,4,FrugalGPT; UCCI; Conformal Cascade
+Cascade routing (unified),optimal mix of route + cascade per step,variable,provably dominates both,requires calibrated quality estimator,same as cascade,2-K,Medium-High,3,ETH arXiv:2410.10347
+Bandit / online (PILOT),LinUCB + preference prior + knapsack budget,~ms,75% (25% of GPT-4 cost at 93% quality),adapts to drift; +3.35% OOD mitigation,online feedback,any,High,2 (code not public),PILOT (EMNLP 2025 Findings)
+Bandit + latency (MixLLM),per-LLM quality/cost regressors + latency penalty + policy gradient,~ms,76-83% (24.18% -> 16.79% of cost),97.25-98.55% of GPT-4,online feedback,any,High,2,MixLLM (NAACL 2025)
+Uncertainty / conformal,prediction-set size or calibrated error probability,+calibration pass,31%,distribution-free coverage guarantee,calibration set,2-K,Medium,4,CP-Router (AAAI 2026); UCCI
+Hidden-state probe,"internal activations, cross-layer Dirichlet aggregation",needs model internals,not reported,+16.68% router ability,multi-domain data,2,High (needs model internals),2,ProbeDirichlet (arXiv:2602.11877)
+LLM-as-classifier,prompt a cheap LLM to pick the model,200-2000 ms,often negative after overhead,85-90% accuracy,prompt engineering,any,Low (but high cost),2,anti-pattern; last-tier only
+Hybrid / compositional,layered rules -> embedding -> classifier -> LLM -> cascade,1 ms - 800 ms,40-85% (mix-dependent),best of each layer,per-layer,any,High,5,vLLM Semantic Router
+Reasoning-mode routing,think vs do-not-think,~ms,"-48.5% tokens, -47.1% latency",+10.2 pp accuracy,small labeled set,2 modes,Medium,4,vLLM-SR (arXiv:2510.08731)
