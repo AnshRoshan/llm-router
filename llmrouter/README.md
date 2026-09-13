@@ -247,6 +247,68 @@ decision = router.decide(RoutingRequest(
 decision.model_id, decision.backend_id, decision.ttl_by_segment
 ```
 
+## The learning layer: `explain` / `calibrate` / `eval`
+
+A router you cannot interrogate is a router you cannot trust. The CLI runs the
+pure decision layer — no keys, no network:
+
+```bash
+python -m llmrouter explain --system "You are a support bot" --prompt "hi"
+python -m llmrouter eval --data cases.jsonl --ci --quality-floor 0.75
+python -m llmrouter calibrate --data cases.jsonl --target-strong-pct 0.5
+```
+
+- **`explain`** routes one prompt and prints the full auditable decision —
+  candidates, scores, TTL choices, and the reason the workload class was chosen.
+- **`eval`** runs a JSONL case file (`{"text": ..., "workload": ...}` per line,
+  optionally `expected_model` for a misroute audit) and reports routing mix,
+  estimated cost, average quality, and decision latency. With `--ci` it **exits
+  non-zero** when quality drops below the floor, cases become unroutable, or the
+  decision p50 exceeds 10 ms — the pre-merge gate for any routing change.
+- **`calibrate`** sweeps the quality floor (`Weights.min_quality`, the router's
+  operating point) and reports the value that achieves your target strong-model
+  share — the RouteLLM `calibrate_threshold` pattern, generalized past two
+  models.
+
+## Hard constraints and budget pacing
+
+The decision layer enforces what the caller declares, before any call is made:
+
+```python
+from llmrouter import Constraints, Message, RoutingRequest
+
+req = RoutingRequest(
+    messages=[Message("user", "hi")],
+    constraints=Constraints(
+        max_cost_usd=0.01,            # per-turn cap: cheapest violator wins if nothing fits
+        budget_remaining_usd=5.00,    # pacing: projected session spend over budget is penalized
+        residency_tags=frozenset({"eu"}),   # fail closed — no compliant model, no call
+    ),
+)
+```
+
+Prompts are also validated against each candidate's **context window before
+calling** (with headroom reserved for the response), so a too-big request routes
+to a model that can actually serve it instead of failing at the provider.
+
+## Rule F: cache-invalidating drift
+
+A provider's cache key covers more than the prefix text — tool schemas, image
+usage, thinking/effort settings. If those change **within a live session**, the
+cache is gone and raising `thinking.effort` on the same model invalidates it as
+thoroughly as switching models. The router fingerprints those fields per
+session; when they drift, every candidate is scored cold for that turn (no
+affinity bonus, no switch-cost asymmetry), and a reason says so. Escalating by
+changing an invalidating field is therefore priced honestly.
+
+## Circuit breaker: recovery through a canary
+
+After `allowed` consecutive failures the circuit opens with exponential
+backoff. When the backoff elapses the backend is **half-open**: exactly one
+probe request is admitted, and full recovery waits for it to succeed. A failed
+probe re-opens the circuit and revokes the slot. The canary is a real request
+that was going out anyway — there is no health-check call to the provider.
+
 ## Self-hosted and mixed deployments
 
 Register your own backends. `cost_factor` is your marginal cost relative to list
@@ -292,7 +354,7 @@ the affinity logic is not working.
 
 ```bash
 pip install -e ".[dev]"
-pytest            # 148 tests
+pytest            # 168 tests
 ```
 
 ## Caveats

@@ -69,6 +69,11 @@ class SessionPolicy:
     #: Incremented when a better model was available but the session had too few
     #: turns left to migrate. A real, surfaced metric.
     stranded_count: int = 0
+    #: Fingerprint of the request fields that are part of the provider's cache
+    #: key but outside the prefix (tool schemas, images). When it drifts within a
+    #: live session the cache is gone — Rule F — and the session must be scored
+    #: cold until the counters say otherwise.
+    invalidators_hash: str | None = None
     last_seen: float = field(default_factory=time.monotonic)
 
     @property

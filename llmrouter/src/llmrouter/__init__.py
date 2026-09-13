@@ -51,7 +51,7 @@ from .affinity import (
     rendezvous_pick,
     rendezvous_rank,
 )
-from .backends import BackendHealth, BackendRegistry, BackendSpec
+from .backends import BackendHealth, BackendRegistry, BackendSpec, HALF_OPEN_PROBE_LIMIT
 from .delegation import (
     DELEGABLE_PHASES,
     LEAD_ONLY_PHASES,
@@ -110,7 +110,7 @@ from .types import (
     WorkloadSource,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -154,6 +154,7 @@ __all__ = [
     "BackendSpec",
     "BackendHealth",
     "BackendRegistry",
+    "HALF_OPEN_PROBE_LIMIT",
     # policy
     "PolicyEngine",
     "RouterConfig",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmrouter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cache-aware LLM routing: picks the (model, backend) pair, keeps sessions sticky, and chooses prompt-cache TTL per breakpoint."
 readme = "README.md"
 requires-python = ">=3.10"

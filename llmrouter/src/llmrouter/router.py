@@ -303,6 +303,10 @@ class Router:
                 break
 
             health = self.backends.health(backend.backend_id)
+            # Claim a canary slot if this backend is HALF_OPEN: exactly one
+            # request may probe it while the circuit recovers.
+            if health.is_half_open():
+                health.half_open_probes += 1
             health.in_flight += 1
             started = time.monotonic()
             try:
@@ -575,6 +579,9 @@ class Router:
                 pinned_model=decision.model_id,
                 pinned_backend=decision.backend_id,
                 pinned_at=time.monotonic(),
+                # Baseline for Rule F drift detection: the invalidating fields
+                # of the request that created the session.
+                invalidators_hash=req.invalidators_fingerprint(),
             )
         else:
             # Re-pin after a migration so subsequent turns are sticky again.

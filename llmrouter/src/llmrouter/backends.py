@@ -109,6 +109,9 @@ class BackendHealth:
                 CIRCUIT_MAX_BACKOFF_S,
             )
             self.open_until = now + backoff
+            # A failure while half-open re-opens the circuit; any in-flight
+            # canary allowance is revoked with it.
+            self.half_open_probes = 0
 
     def saturating(self, spec: BackendSpec) -> bool:
         """True when the backend should be shed rather than queued."""
@@ -122,6 +125,12 @@ class BackendHealth:
 CIRCUIT_FAILURE_THRESHOLD = 5
 CIRCUIT_BASE_BACKOFF_S = 1.0
 CIRCUIT_MAX_BACKOFF_S = 60.0
+
+#: How many probe requests may be in flight against a HALF_OPEN backend. Full
+#: recovery is gated behind a cheap canary: one probe, and only after it
+#: succeeds does the circuit close. Never probe by calling the provider for
+#: health's sake — the canary is a real request that was going out anyway.
+HALF_OPEN_PROBE_LIMIT = 1
 
 
 class BackendRegistry:
@@ -153,13 +162,20 @@ class BackendRegistry:
         return tuple(b for b in self._specs.values() if b.supports(model_id))
 
     def available_for(self, model_id: str, now: float | None = None) -> tuple[BackendSpec, ...]:
-        """Healthy, non-saturated backends that serve this model, by priority."""
+        """Healthy, non-saturated backends that serve this model, by priority.
+
+        A HALF_OPEN backend is admitted only while a canary slot is free: full
+        recovery waits for one real request to succeed.
+        """
         now = now if now is not None else time.monotonic()
         out = []
         for b in self.candidates_for(model_id):
             h = self.health(b.backend_id)
-            if h.is_available(now) and not h.saturating(b):
-                out.append(b)
+            if not h.is_available(now) or h.saturating(b):
+                continue
+            if h.is_half_open(now) and h.half_open_probes >= HALF_OPEN_PROBE_LIMIT:
+                continue
+            out.append(b)
         return tuple(sorted(out, key=lambda b: b.priority))
 
     def all_available(self, now: float | None = None) -> tuple[BackendSpec, ...]:

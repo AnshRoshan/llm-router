@@ -1,0 +1,340 @@
+"""Command-line surface: the learning layer's minimum viable loop.
+
+Three commands, all running the PURE decision layer (no network, no keys):
+
+  explain     route one prompt and print the full auditable decision
+  calibrate   sweep the quality floor to hit a target strong-model share
+              (the RouteLLM calibrate_threshold pattern, per-workload)
+  eval        run a labeled case file, report quality/cost/mix/latency,
+              and — with --ci — exit non-zero when quality drops below
+              the floor (the pre-merge gate)
+
+Case file format: one JSON object per line. Shorthand is `{"text": "..."}`;
+full form is `{"messages": [...], "workload": "chat", "session_id": "s1",
+"expected_model": "claude-haiku-class"}`. `expected_model` turns eval into a
+misroute audit. Lines starting with `#` are comments.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+from dataclasses import replace
+from typing import Any, Mapping, Sequence
+
+from .backends import BackendRegistry, BackendSpec
+from .policy import PolicyEngine, RouterConfig, Weights
+from .pricing import PriceRegistry
+from .signals import WorkloadResolver
+from .types import DeploymentClass, Message, RoutingRequest, WorkloadClass
+
+#: Decision-latency alarm (ms). The decision layer is pure arithmetic; if the
+#: p50 approaches this the router is costing more than it saves.
+DECISION_LATENCY_ALARM_MS = 10.0
+
+
+# --------------------------------------------------------------------------- #
+# A pure decision engine over the bundled defaults
+# --------------------------------------------------------------------------- #
+def pure_engine(config: RouterConfig | None = None) -> PolicyEngine:
+    """Decision-only engine: bundled price cards, one logical backend per
+    provider, no keys and no network. This is what the CLI runs on."""
+    prices = PriceRegistry()
+    ids = prices.ids()
+    backends = BackendRegistry([
+        BackendSpec("anthropic", DeploymentClass.API,
+                    models=tuple(m for m in ids if m.startswith("claude")),
+                    priority=0),
+        BackendSpec("openai", DeploymentClass.API,
+                    models=tuple(m for m in ids if m.startswith("gpt")),
+                    priority=1),
+    ])
+    return PolicyEngine(prices, backends, WorkloadResolver(), config)
+
+
+def build_request(args: argparse.Namespace) -> RoutingRequest:
+    tools: tuple[Mapping[str, Any], ...] = ()
+    if getattr(args, "tools", None):
+        with open(args.tools, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, list):
+            loaded = [loaded]
+        tools = tuple(loaded)
+
+    messages: list[Message] = []
+    if getattr(args, "system", None):
+        messages.append(Message("system", args.system))
+    messages.append(Message("user", args.prompt))
+
+    workload = getattr(args, "workload", None)
+    return RoutingRequest(
+        messages=tuple(messages),
+        workload=WorkloadClass(workload) if workload else None,
+        session_id=getattr(args, "session_id", None),
+        tools=tools,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Case files
+# --------------------------------------------------------------------------- #
+def load_cases(path: str) -> list[tuple[int, Mapping[str, Any], tuple[Message, ...]]]:
+    """Parse a JSONL case file into (line_number, meta, messages)."""
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+
+    cases: list[tuple[int, Mapping[str, Any], tuple[Message, ...]]] = []
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        obj = json.loads(line)
+        if "messages" in obj:
+            msgs = tuple(
+                Message(str(m.get("role", "user")), str(m.get("content", "")))
+                for m in obj["messages"]
+            )
+        else:
+            text = obj.get("text", obj.get("prompt"))
+            if text is None:
+                raise ValueError(
+                    f"line {lineno}: case needs 'messages' or 'text'"
+                )
+            msgs = (Message("user", str(text)),)
+        cases.append((lineno, obj, msgs))
+    return cases
+
+
+def _case_request(meta: Mapping[str, Any], msgs: tuple[Message, ...],
+                  default_workload: str) -> RoutingRequest:
+    workload = meta.get("workload", default_workload)
+    return RoutingRequest(
+        messages=msgs,
+        workload=WorkloadClass(str(workload)),
+        session_id=meta.get("session_id"),
+        tools=tuple(meta.get("tools", ()) or ()),
+        retrieved=tuple(str(r) for r in (meta.get("retrieved", ()) or ())),
+        tags=frozenset(str(t) for t in (meta.get("tags", ()) or ())),
+    )
+
+
+def _strong_models(engine: PolicyEngine, workload: WorkloadClass) -> set[str]:
+    """A model is 'strong' for a workload when it carries the best quality prior
+    available. Mirrors RouteLLM's strong/weak split for N>2 candidates."""
+    qualities = {
+        c.model_id: c.quality(workload.value) for c in engine.prices.all()
+    }
+    if not qualities:
+        return set()
+    top = max(qualities.values())
+    return {m for m, q in qualities.items() if q == top}
+
+
+# --------------------------------------------------------------------------- #
+# explain
+# --------------------------------------------------------------------------- #
+def cmd_explain(args: argparse.Namespace) -> int:
+    engine = pure_engine()
+    decision = engine.decide(build_request(args))
+    print(decision.explain())
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# calibrate
+# --------------------------------------------------------------------------- #
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    cases = load_cases(args.data)
+    if not cases:
+        print("no cases found in", args.data, file=sys.stderr)
+        return 2
+
+    base = pure_engine().config
+    grid = [round(0.05 * i, 2) for i in range(20)]  # 0.00 .. 0.95
+    target = args.target_strong_pct
+
+    rows: list[tuple[float, float, int]] = []  # (threshold, strong_share, unroutable)
+    for threshold in grid:
+        engine = pure_engine(RouterConfig(
+            weights=replace(base.weights, min_quality=threshold)))
+        strong_hits = 0
+        unroutable = 0
+        for _, meta, msgs in cases:
+            req = _case_request(meta, msgs, args.workload)
+            strong = _strong_models(engine, req.workload)
+            try:
+                d = engine.decide(req)
+            except RuntimeError:
+                unroutable += 1
+                continue
+            if d.model_id in strong:
+                strong_hits += 1
+        share = strong_hits / len(cases)
+        rows.append((threshold, share, unroutable))
+
+    valid = [r for r in rows if r[2] < len(cases)]
+    if not valid:
+        print("every threshold unrouted every case — the quality floor exceeds "
+              "all bundled quality priors", file=sys.stderr)
+        return 2
+
+    # Closest share to the target; ties resolve toward the HIGHER floor, which
+    # is the more conservative operating point.
+    best = min(valid, key=lambda r: (abs(r[1] - target), -r[0]))
+
+    if not args.quiet:
+        print(f"{'min_quality':>12} {'strong_share':>13} {'unroutable':>11}")
+        for t, share, unroutable in rows:
+            marker = "  <-- calibrated" if t == best[0] else ""
+            print(f"{t:>12.2f} {share:>13.3f} {unroutable:>11}{marker}")
+
+    print(f"\ncalibrated min_quality = {best[0]:.2f} "
+          f"(target strong-model share {target:.2f}, achieved {best[1]:.3f} "
+          f"on {len(cases)} cases)")
+    print("set it with: RouterConfig(weights=Weights(min_quality="
+          f"{best[0]}))")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# eval — the CI gate
+# --------------------------------------------------------------------------- #
+def cmd_eval(args: argparse.Namespace) -> int:
+    base = pure_engine().config
+    engine = pure_engine(RouterConfig(
+        weights=replace(base.weights, min_quality=args.min_quality)))
+    cases = load_cases(args.data)
+    if not cases:
+        print("no cases found in", args.data, file=sys.stderr)
+        return 2
+
+    mix: dict[str, int] = {}
+    qualities: list[float] = []
+    costs = 0.0
+    latencies: list[float] = []
+    misroutes: list[str] = []
+    unroutable: list[int] = []
+
+    for lineno, meta, msgs in cases:
+        req = _case_request(meta, msgs, args.workload)
+        try:
+            d = engine.decide(req)
+        except RuntimeError as exc:
+            unroutable.append(lineno)
+            if args.verbose:
+                print(f"line {lineno}: UNROUTABLE: {exc}")
+            continue
+        # Decision latency: measured on a second decide() because the decision
+        # is pure and deterministic — the reported number is real wall-clock.
+        latencies.append(_measure_decide(engine, req))
+        card = engine.prices.require(d.model_id)
+        q = card.quality(d.workload.value)
+        qualities.append(q)
+        costs += d.candidates[0].cost_usd if d.candidates else 0.0
+        mix[d.model_id] = mix.get(d.model_id, 0) + 1
+        expected = meta.get("expected_model")
+        if expected and d.model_id != expected:
+            misroutes.append(f"line {lineno}: expected {expected}, got {d.model_id}")
+        if args.verbose:
+            print(f"line {lineno}: {d.model_id}@{d.backend_id} q={q:.2f}")
+
+    p50 = statistics.median(latencies) if latencies else float("nan")
+    avg_q = statistics.mean(qualities) if qualities else 0.0
+
+    print(f"cases: {len(cases)}  routed: {len(qualities)}  "
+          f"unroutable: {len(unroutable)}")
+    print(f"routing mix: {json.dumps(mix, sort_keys=True)}")
+    print(f"avg quality: {avg_q:.3f}  est cost: ${costs:.5f}  "
+          f"decision p50: {p50:.2f}ms")
+    if misroutes:
+        print(f"misroutes ({len(misroutes)}):")
+        for m in misroutes[:10]:
+            print(f"  {m}")
+
+    if args.ci:
+        failures: list[str] = []
+        if avg_q < args.quality_floor:
+            failures.append(
+                f"avg quality {avg_q:.3f} < floor {args.quality_floor:.3f}"
+            )
+        if unroutable:
+            failures.append(f"{len(unroutable)} case(s) unroutable")
+        if misroutes and args.fail_on_misroute:
+            failures.append(f"{len(misroutes)} misroute(s) vs expected_model")
+        if latencies and p50 > DECISION_LATENCY_ALARM_MS:
+            failures.append(
+                f"decision p50 {p50:.2f}ms > {DECISION_LATENCY_ALARM_MS:.0f}ms"
+            )
+        if failures:
+            print("CI gate FAILED: " + "; ".join(failures))
+            return 1
+        print("CI gate passed "
+              f"(floor {args.quality_floor:.2f}, "
+              f"latency <{DECISION_LATENCY_ALARM_MS:.0f}ms)")
+    return 0
+
+
+def _measure_decide(engine: PolicyEngine, req: RoutingRequest) -> float:
+    import time
+    t0 = time.perf_counter()
+    engine.decide(req)
+    return (time.perf_counter() - t0) * 1000.0
+
+
+# --------------------------------------------------------------------------- #
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m llmrouter",
+        description="Cache-aware LLM routing — decision-layer CLI "
+                    "(no network, no keys)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("explain", help="route one prompt and explain it")
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--system", default=None)
+    p.add_argument("--workload", default=None,
+                   choices=[w.value for w in WorkloadClass])
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--tools", default=None,
+                   help="path to a JSON array of tool schemas")
+    p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser("calibrate",
+                       help="pick the quality floor hitting a target "
+                            "strong-model share")
+    p.add_argument("--data", required=True,
+                   help="JSONL case file ('-' for stdin)")
+    p.add_argument("--target-strong-pct", type=float, default=0.5)
+    p.add_argument("--workload", default="chat",
+                   help="default workload for cases without one")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser("eval",
+                       help="run labeled cases; --ci gates on the quality floor")
+    p.add_argument("--data", required=True)
+    p.add_argument("--workload", default="chat")
+    p.add_argument("--min-quality", type=float, default=0.0,
+                   help="the operating point under test")
+    p.add_argument("--quality-floor", type=float, default=0.75)
+    p.add_argument("--ci", action="store_true",
+                   help="exit 1 when quality/latency gates fail")
+    p.add_argument("--fail-on-misroute", action="store_true",
+                   help="also fail when expected_model disagrees")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=cmd_eval)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+__all__ = ["main", "pure_engine", "load_cases", "build_request"]

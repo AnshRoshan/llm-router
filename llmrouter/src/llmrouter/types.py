@@ -171,6 +171,22 @@ class RoutingRequest:
         material = f"{self.system_text()}\x00{tool_schemas}".encode("utf-8")
         return hashlib.blake2b(material, digest_size=16).hexdigest()
 
+    def invalidators_fingerprint(self) -> str:
+        """Hash of the request fields that are part of a provider cache key but
+        OUTSIDE the prefix text: tool schemas and image presence (Rule F).
+
+        Anthropic's cache key covers `tool_choice`, `thinking`, images and
+        `output_config.effort` in addition to the prefix — changing any of them
+        mid-session invalidates the cache as thoroughly as switching models. A
+        pinned session whose fingerprint drifts must therefore be scored as if
+        cold, not rewarded for a cache that no longer exists.
+        """
+        tool_schemas = json.dumps(
+            [dict(t) for t in self.tools], sort_keys=True, separators=(",", ":")
+        )
+        material = f"{tool_schemas}\x00{int(self.has_images())}".encode("utf-8")
+        return hashlib.blake2b(material, digest_size=8).hexdigest()
+
     def sticky_key(self) -> str:
         """Derive a session key WITHOUT requiring the caller to send one.
 

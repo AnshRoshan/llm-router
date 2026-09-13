@@ -95,6 +95,28 @@ The scorer applies `task_cost_multiplier` and measured pair rework, so price-per
 1. `adelegate` ignored `sidekick_model` and routed to whatever scored highest (the frontier model) — defeating delegation entirely. Now pinned via a restricted internal agent profile, so it still passes through hard constraints, health checks, and failover. The pin is a `sidekick_model` property, so it also holds when set after construction (the demo path) — the __init__-only registration silently lost it. Regression-tested.
 2. `record_outcome` only moved `measured_cost_per_task`/`measured_score`, never the `sidekick_attempts`/`rework_factor` that `effective_sidekick_multiplier()` (and thus the scorer) actually reads — so observed behaviour never reached a decision. Fixed, and `adelegate` now auto-records real usage + attempt count. Verified: a forced failover moved the scorer's multiplier 1.0 → 1.3 while the pin held.
 
+## Cross-cutting checklist audit — 2026-09-13 (v0.2.0)
+
+A full audit of the package against the corpus-wide P0 checklist found six gaps; all closed and
+tested (suite: **168 tests pass**, was 148):
+
+| Gap (checklist item) | Fix |
+|---|---|
+| `Weights.min_quality` was **dead code** — the quality floor (the router's operating point, what calibrate tunes and the CI gate guards) was never enforced | enforced in `_passes_hard_constraints`; regression-tested |
+| **Pre-call context-window validation** missing (LiteLLM `enable_pre_call_checks` item); the old constraint check was literal dead code (`card.input_cost(req.constraints.max_cost_usd and 0 or 0)`) | `PolicyEngine.estimate_total_tokens()` (full prompt, not just the cacheable prefix) vs `card.context_window` with `context_headroom_tokens` reserved; too-big prefixes route to a model that fits, or error clearly |
+| **Budget constraints accepted but never checked** (`max_cost_usd` / `budget_remaining_usd`) — "closed-loop budget pacing is the most under-served production requirement" | hard per-turn cap (cheapest violator wins when nothing fits — a preference, not an outage) + pacing penalty on projected session spend exceeding remaining budget |
+| **Rule F not implemented** — `CacheSemantics.invalidating_fields` existed but was referenced nowhere; invalidating drift within a pinned session went unscored | `RoutingRequest.invalidators_fingerprint()` (tool schemas + image usage) stored per session; on drift every candidate is scored cold (affinity 0, no switch-cost asymmetry) and a reason is emitted; baseline re-arms after the turn |
+| **HALF_OPEN canary unused** — `half_open_probes` existed but recovery was not gated | `HALF_OPEN_PROBE_LIMIT = 1`: a half-open backend admits one probe request; success closes, failure re-opens and revokes the slot; the probe is a real request, never a provider health call |
+| **Learning-layer CLI missing entirely** (the (c) of the product gap: calibration CLI, eval CI gate, first-class explainability) | `python -m llmrouter` with `explain` (auditable single decision), `eval --ci` (JSONL cases; fails on quality floor, unroutable cases, `expected_model` misroutes, or decision p50 > 10 ms), `calibrate --target-strong-pct` (sweeps `min_quality` to a target strong-model share — the RouteLLM `calibrate_threshold` pattern generalized past 2 models) |
+
+**One more live falsy-trap bug found by the new tests:** `PriceRegistry(cards={})` silently
+resurrected the bundled defaults (`cards or default_price_cards()`) — the exact bug class doc 00
+recorded as "all 8 sites fixed". Fixed with an explicit `is None` check; an empty registry now
+means "start from nothing".
+
+Research→code deltas this round, by design doc: 06 (eval harness + calibration CLI + CI gate),
+05 (pre-call checks), 03 (budget pacing), 07/09 (Rule F scoring), 05 (canary-gated recovery).
+
 ## Unresolved / needs further work before design sign-off
 
 - [ ] **Bedrock Intelligent Prompt Routing pricing** — $1.00 per 1,000 routed requests (cloudburn.io,

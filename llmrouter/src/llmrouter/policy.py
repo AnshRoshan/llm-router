@@ -66,6 +66,11 @@ class RouterConfig:
     enable_step_escalation: bool = True
     #: Keepalive pinger is opt-in: it needs a background timer per live session.
     enable_keepalive: bool = False
+    #: Reserved output tokens when checking a candidate's context window before
+    #: calling (the pre-call check). A prefix that fills the window leaves no
+    #: room for the response; better to filter the candidate than to have the
+    #: provider reject the call mid-session.
+    context_headroom_tokens: int = 4096
 
 
 @dataclass(frozen=True)
@@ -125,6 +130,21 @@ class PolicyEngine:
         est = int(chars * self.config.est_tokens_per_char)
         return est if est > 0 else 0
 
+    def estimate_total_tokens(self, req: RoutingRequest) -> int:
+        """Estimate the FULL prompt, including the current user turn.
+
+        The cacheable prefix excludes the turn being sent (it is not cacheable
+        yet), but the provider's context window does not — the pre-call window
+        check must count everything.
+        """
+        chars = sum(len(m.text) for m in req.messages)
+        chars += sum(len(str(t)) for t in req.tools)
+        chars += sum(len(r) for r in req.retrieved)
+        est = int(chars * self.config.est_tokens_per_char)
+        # Never smaller than the prefix estimate: they measure overlapping
+        # material and a floor of zero would defeat the window check.
+        return max(est, self.estimate_prefix_tokens(req))
+
     def estimate_turn_cost(self, card: PriceCard, prefix_tokens: int,
                            hit_rate: float, output_tokens: int = 500) -> float:
         """Expected $ for one turn, modelling the cache honestly.
@@ -169,6 +189,7 @@ class PolicyEngine:
 
         # ---- 2. session shape ------------------------------------------ #
         prefix_tokens = self.estimate_prefix_tokens(req)
+        total_tokens = self.estimate_total_tokens(req)
         gap_s = (
             req.expected_gap_s
             if req.expected_gap_s is not None
@@ -189,12 +210,31 @@ class PolicyEngine:
         pinned_model = session.pinned_model if session else None
         pinned_backend = session.pinned_backend if session else None
 
+        # ---- 3b. Rule F: cache-invalidating fields ---------------------- #
+        # The provider's cache key covers more than the prefix text: tool
+        # schemas, image usage, thinking/effort settings. If those drift within
+        # a live session, the cache is gone and EVERY candidate is cold — the
+        # warm pair must not be rewarded for a cache that no longer exists.
+        inv_fp = req.invalidators_fingerprint()
+        rule_f_invalidated = False
+        if session is not None:
+            if session.invalidators_hash is None:
+                session.invalidators_hash = inv_fp
+            elif session.invalidators_hash != inv_fp:
+                rule_f_invalidated = True
+                session.invalidators_hash = inv_fp
+                reasons.append(
+                    "Rule F: cache-invalidating request fields changed (tool "
+                    "schema / image usage) — all candidates scored cold"
+                )
+
         # ---- 4. score every (model, backend) pair ---------------------- #
         scored: list[ScoredCandidate] = []
+        over_budget: list[ScoredCandidate] = []
         for card in self.prices.all():
             if card.model_id not in allowed:
                 continue
-            if not self._passes_hard_constraints(card, req):
+            if not self._passes_hard_constraints(card, req, workload, total_tokens):
                 continue
 
             for backend in self.backends.available_for(card.model_id, now):
@@ -202,6 +242,8 @@ class PolicyEngine:
                 if session is not None and card.model_id == pinned_model:
                     # Learned, not assumed: the provider tells us the real rate.
                     hit_rate = session.hit_rate(prior)
+                if rule_f_invalidated:
+                    hit_rate = 0.0
 
                 turn_cost = self.estimate_turn_cost(card, prefix_tokens, hit_rate)
                 cost = turn_cost * backend.cost_factor * self._pair_multiplier(card)
@@ -214,19 +256,47 @@ class PolicyEngine:
                     and card.model_id == pinned_model
                     and backend.backend_id == pinned_backend
                 )
-                affinity_bonus = hit_rate if is_warm else 0.0
+                affinity_bonus = 0.0 if rule_f_invalidated else (
+                    hit_rate if is_warm else 0.0
+                )
 
                 # Switch cost: what it costs to cold-write the prefix elsewhere.
+                # Under Rule F invalidation everyone pays a write anyway, so the
+                # relative term would double-count.
                 switch_cost = 0.0
-                if session is not None and not is_warm and affinity_enabled:
+                if (session is not None and not is_warm and affinity_enabled
+                        and not rule_f_invalidated):
                     switch_cost = self._switch_cost(
                         session, card, prefix_tokens, workload
                     )
 
                 quality = card.quality(workload.value)
+
+                cap = req.constraints.max_cost_usd
+                over_cap = cap is not None and cost > cap
+
+                # Closed-loop budget pacing: a request whose projected session
+                # spend exceeds the remaining budget is penalized in proportion
+                # to the overshoot. Open-ended pacing without this overshoots.
+                budget_penalty = 0.0
+                projected = 0.0
+                remaining = req.constraints.budget_remaining_usd
+                if remaining is not None and not over_cap:
+                    projected = cost * max(1, turns_remaining)
+                    if projected > remaining:
+                        budget_penalty = projected - remaining
+
+                cand_reasons = [f"hit_rate={hit_rate:.2f}", f"warm={is_warm}"]
+                if budget_penalty > 0:
+                    cand_reasons.append(
+                        f"budget pacing: projected ${projected:.4f} exceeds "
+                        f"${remaining:.4f} remaining"
+                    )
+
                 score = (
                     w.quality * quality
                     - w.cost * cost * w.quality_cost_tradeoff
+                    - w.cost * budget_penalty
                     - w.latency * latency
                     - w.switch_cost * switch_cost
                     + w.affinity * affinity_bonus
@@ -241,12 +311,27 @@ class PolicyEngine:
                     latency_ms=latency,
                     affinity=affinity_bonus,
                     switch_cost_usd=switch_cost,
-                    reasons=(
-                        f"hit_rate={hit_rate:.2f}",
-                        f"warm={is_warm}",
-                    ),
+                    reasons=tuple(cand_reasons),
                 )
-                scored.append(ScoredCandidate(cand, card, backend))
+                entry = ScoredCandidate(cand, card, backend)
+                if over_cap:
+                    over_budget.append(entry)
+                else:
+                    scored.append(entry)
+
+        budget_fallback = False
+        if not scored and over_budget:
+            # A cap no candidate can meet is a preference, not an outage: pick
+            # the cheapest violator rather than erroring, and say so. (If the
+            # list is empty for hard-constraint reasons the error below stands —
+            # there is no honest way to serve the request.)
+            scored = over_budget
+            budget_fallback = True
+            cheapest = min(scored, key=lambda s: s.candidate.cost_usd)
+            reasons.append(
+                f"budget cap ${req.constraints.max_cost_usd:.4f} excludes every "
+                f"candidate; chose the cheapest ({cheapest.candidate.model_id})"
+            )
 
         if not scored:
             raise RuntimeError(
@@ -255,7 +340,11 @@ class PolicyEngine:
                 "and backend health"
             )
 
-        scored.sort(key=lambda s: s.candidate.score, reverse=True)
+        if budget_fallback:
+            # Honor the cap's intent: order by cost, so best = cheapest.
+            scored.sort(key=lambda s: s.candidate.cost_usd)
+        else:
+            scored.sort(key=lambda s: s.candidate.score, reverse=True)
         best = scored[0]
 
         # ---- 5. stickiness / migration -------------------------------- #
@@ -381,14 +470,17 @@ class PolicyEngine:
                 return set(profile.allowed_models) & set(self.prices.ids())
         return set(self.prices.ids())
 
-    def _passes_hard_constraints(self, card: PriceCard,
-                                 req: RoutingRequest) -> bool:
-        if card.quality(req.workload.value if req.workload else "chat") < 0:
+    def _passes_hard_constraints(self, card: PriceCard, req: RoutingRequest,
+                                 workload: WorkloadClass,
+                                 prompt_tokens: int) -> bool:
+        quality = card.quality(workload.value)
+        if quality < 0:
+            # A negative prior means "explicitly unsupported for this workload".
             return False
-        if self.config.weights.min_quality > 0:
-            # Checked against the resolved workload by the caller's tags only;
-            # the engine re-checks after resolution via the score floor.
-            pass
+        if self.config.weights.min_quality > 0 and quality < self.config.weights.min_quality:
+            # The quality floor is the router's operating point: it is what
+            # `calibrate` tunes, and what the eval CI gate guards.
+            return False
         if req.constraints.require_tools and not card.supports_tools:
             return False
         if card.supports_vision is False and req.has_images():
@@ -397,9 +489,13 @@ class PolicyEngine:
             req.constraints.residency_tags <= card.residency_tags
         ):
             return False
-        if card.context_window and req.constraints.max_cost_usd is not None:
-            if card.input_cost(req.constraints.max_cost_usd and 0 or 0) < 0:
-                return False
+        # Pre-call context validation: a prompt that fills the window leaves no
+        # room for the response, and the provider would reject the call.
+        # Measured against the FULL prompt (see estimate_total_tokens).
+        if (card.context_window
+                and prompt_tokens + self.config.context_headroom_tokens
+                > card.context_window):
+            return False
         return True
 
     def _latency(self, card: PriceCard, backend: BackendSpec) -> float:

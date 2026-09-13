@@ -217,7 +217,13 @@ class PriceRegistry:
     """
 
     def __init__(self, cards: Mapping[str, PriceCard] | None = None) -> None:
-        self._cards: dict[str, PriceCard] = dict(cards or default_price_cards())
+        # Explicit `is None`: an EMPTY mapping means "start from nothing" —
+        # the falsy-or-default idiom here silently resurrected the bundled
+        # cards and was exactly the registry bug class the research log warns
+        # about.
+        self._cards: dict[str, PriceCard] = dict(
+            default_price_cards() if cards is None else cards
+        )
 
     def register(self, card: PriceCard) -> None:
         self._cards[card.model_id] = card
