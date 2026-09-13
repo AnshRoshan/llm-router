@@ -117,6 +117,24 @@ means "start from nothing".
 Research→code deltas this round, by design doc: 06 (eval harness + calibration CLI + CI gate),
 05 (pre-call checks), 03 (budget pacing), 07/09 (Rule F scoring), 05 (canary-gated recovery).
 
+## Round 2 — 2026-09-13, v0.3.0 (quality pass + second runtime + site)
+
+- **Python v0.3.0**: `Router.pure()` (decision-only facade, no keys/network), `eval --json`
+  (machine-readable CI artifact), and the §8.10 eval metric **cache hit rate by WorkloadSource**
+  (`stats()["sessions"]["hit_rate_by_source"]`) — the check that catches the inference layer
+  misrouting. 170 tests pass.
+- **npm package** (`npm/llmrouter`, v0.1.0): zero-dependency TypeScript port of the DECISION layer —
+  same price cards, `R*`/`E*`/TTL formulas, pair scoring, Rule F, budget pacing, canary breaker,
+  fingerprint/sticky-key chain, and an `npx llmrouter` CLI (explain/eval --ci/calibrate). 16 node:test
+  assertions mirror the Python economics assertions (R*=4.75, $0.6225/$0.4300, E*=0.652, G*=37.5).
+  Porting caught one real bug in the new code itself: the breakpoint sort comparator was inverted
+  (longer-TTL-first is easy to get backwards); `assertTtlOrdering` caught it in the paired test.
+- **Website** (`website/`): static, no build step, no dependencies — hero with verified-economics
+  proof strip (R*, E*, oscillation cost, honest 30-40%), dual-runtime quick start, concept cards
+  (pair scoring, TTL per breakpoint, stickiness, delegation, Rule F, hard constraints), CLI section,
+  Python-vs-npm feature matrix, and an honest-expectations callout. Passed the mechanical slop audit
+  and was visually reviewed at desktop width.
+
 ## Unresolved / needs further work before design sign-off
 
 - [ ] **Bedrock Intelligent Prompt Routing pricing** — $1.00 per 1,000 routed requests (cloudburn.io,

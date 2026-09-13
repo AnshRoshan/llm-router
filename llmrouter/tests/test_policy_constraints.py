@@ -202,3 +202,36 @@ def test_decision_latency_p50_under_10ms():
         samples.append((time.perf_counter() - t0) * 1000.0)
     p50 = statistics.median(samples)
     assert p50 < 10.0, f"decision p50 {p50:.2f}ms exceeds the 10ms budget"
+
+
+# --------------------------------------------------------------------------- #
+# Router.pure(): decision-only facade
+# --------------------------------------------------------------------------- #
+def test_router_pure_decides_without_keys_or_network():
+    import asyncio
+    from llmrouter import ConfigurationError
+
+    router = Router.pure()
+    d = router.decide(req())
+    assert d.model_id and d.candidates
+    # No transport: execution refuses clearly instead of hanging or failing
+    # opaquely, while the decision surface stays fully usable.
+    with pytest.raises(ConfigurationError):
+        asyncio.run(router.acomplete([Message("user", "hi")]))
+
+
+def test_session_stats_report_hit_rate_by_workload_source():
+    from llmrouter import SessionStore, WorkloadSource
+
+    store = SessionStore()
+    s = SessionPolicy(
+        session_key="sid:a", workload=WorkloadClass.AGENT,
+        source=WorkloadSource.FINGERPRINT, confidence=1.0,
+        pinned_model="claude-sonnet-class", pinned_backend="anthropic",
+        pinned_at=time.monotonic(),
+    )
+    s.record_usage(cache_read_tokens=900, cache_write_tokens=100)
+    store.put(s)
+    stats = store.stats()
+    assert stats["hit_rate_by_source"]["fingerprint"] == pytest.approx(0.9)
+    assert stats["avg_hit_rate"] == pytest.approx(0.9)

@@ -162,6 +162,46 @@ class Router:
     # construction helpers
     # ------------------------------------------------------------------ #
     @classmethod
+    def pure(
+        cls,
+        *,
+        config: RouterConfig | None = None,
+        profiles: Mapping[str, AgentProfile] | None = None,
+        classifier: WorkloadClassifier | None = None,
+        default_workload: WorkloadClass = WorkloadClass.CHAT,
+    ) -> "Router":
+        """Decision-only router over the bundled defaults: no keys, no network.
+
+        `acomplete()` will refuse (no transport), but `decide()`, `explain()`
+        and `should_delegate()` all work. Useful for tests, the CLI, cold paths,
+        and for driving your own HTTP client from the Decision.
+        """
+        prices = PriceRegistry()
+        ids = prices.ids()
+        backends = BackendRegistry([
+            BackendSpec(
+                backend_id="anthropic", deployment=DeploymentClass.API,
+                models=tuple(m for m in ids if m.startswith("claude")),
+                priority=0,
+            ),
+            BackendSpec(
+                backend_id="openai", deployment=DeploymentClass.API,
+                models=tuple(m for m in ids if m.startswith("gpt")),
+                priority=1,
+            ),
+        ])
+        return cls(
+            prices=prices,
+            backends=backends,
+            resolver=WorkloadResolver(
+                profiles=profiles,
+                classifier=classifier,
+                default_workload=default_workload,
+            ),
+            config=config,
+        )
+
+    @classmethod
     def with_defaults(
         cls,
         *,

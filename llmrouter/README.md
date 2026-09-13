@@ -348,13 +348,22 @@ warning is a cache-hit-rate bug report for *their* prompts.
 
 The metric that matters most: **cache hit rate broken down by routing decision**.
 If the hit rate for pinned sessions is not materially higher than for the rest,
-the affinity logic is not working.
+the affinity logic is not working. `stats()["sessions"]["hit_rate_by_source"]`
+breaks it down by how the workload class was learned.
+
+## Other runtimes
+
+The decision engine is also available for Node.js: [`npm/llmrouter`](../npm/llmrouter)
+(`npm install llmrouter`) is a zero-dependency TypeScript port of this package's
+decision layer — same price cards, same formulas, same decisions, asserted by a
+paired test suite. The documentation site in [`website/`](../website) covers
+both packages side by side.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest            # 168 tests
+pytest            # 170 tests
 ```
 
 ## Caveats

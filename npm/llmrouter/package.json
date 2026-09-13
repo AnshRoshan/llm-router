@@ -1,0 +1,42 @@
+{
+  "name": "llmrouter",
+  "version": "0.1.0",
+  "description": "Cache-aware LLM routing for Node.js: picks the (model, backend) pair, keeps sessions sticky, and chooses prompt-cache TTL per breakpoint. Zero dependencies.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "llmrouter": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"test/**/*.test.mjs\""
+  },
+  "keywords": [
+    "llm",
+    "router",
+    "prompt-caching",
+    "kv-cache",
+    "cost-optimization",
+    "ai"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

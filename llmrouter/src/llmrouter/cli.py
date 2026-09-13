@@ -23,11 +23,9 @@ import sys
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
-from .backends import BackendRegistry, BackendSpec
 from .policy import PolicyEngine, RouterConfig, Weights
-from .pricing import PriceRegistry
-from .signals import WorkloadResolver
-from .types import DeploymentClass, Message, RoutingRequest, WorkloadClass
+from .router import Router
+from .types import Message, RoutingRequest, WorkloadClass
 
 #: Decision-latency alarm (ms). The decision layer is pure arithmetic; if the
 #: p50 approaches this the router is costing more than it saves.
@@ -40,17 +38,7 @@ DECISION_LATENCY_ALARM_MS = 10.0
 def pure_engine(config: RouterConfig | None = None) -> PolicyEngine:
     """Decision-only engine: bundled price cards, one logical backend per
     provider, no keys and no network. This is what the CLI runs on."""
-    prices = PriceRegistry()
-    ids = prices.ids()
-    backends = BackendRegistry([
-        BackendSpec("anthropic", DeploymentClass.API,
-                    models=tuple(m for m in ids if m.startswith("claude")),
-                    priority=0),
-        BackendSpec("openai", DeploymentClass.API,
-                    models=tuple(m for m in ids if m.startswith("gpt")),
-                    priority=1),
-    ])
-    return PolicyEngine(prices, backends, WorkloadResolver(), config)
+    return Router.pure(config=config).engine
 
 
 def build_request(args: argparse.Namespace) -> RoutingRequest:
@@ -245,15 +233,28 @@ def cmd_eval(args: argparse.Namespace) -> int:
     p50 = statistics.median(latencies) if latencies else float("nan")
     avg_q = statistics.mean(qualities) if qualities else 0.0
 
-    print(f"cases: {len(cases)}  routed: {len(qualities)}  "
-          f"unroutable: {len(unroutable)}")
-    print(f"routing mix: {json.dumps(mix, sort_keys=True)}")
-    print(f"avg quality: {avg_q:.3f}  est cost: ${costs:.5f}  "
-          f"decision p50: {p50:.2f}ms")
-    if misroutes:
-        print(f"misroutes ({len(misroutes)}):")
-        for m in misroutes[:10]:
-            print(f"  {m}")
+    report = {
+        "cases": len(cases),
+        "routed": len(qualities),
+        "unroutable": unroutable,
+        "routing_mix": mix,
+        "avg_quality": round(avg_q, 4),
+        "est_cost_usd": round(costs, 6),
+        "decision_p50_ms": round(p50, 3) if p50 == p50 else None,
+        "misroutes": misroutes,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"cases: {len(cases)}  routed: {len(qualities)}  "
+              f"unroutable: {len(unroutable)}")
+        print(f"routing mix: {json.dumps(mix, sort_keys=True)}")
+        print(f"avg quality: {avg_q:.3f}  est cost: ${costs:.5f}  "
+              f"decision p50: {p50:.2f}ms")
+        if misroutes:
+            print(f"misroutes ({len(misroutes)}):")
+            for m in misroutes[:10]:
+                print(f"  {m}")
 
     if args.ci:
         failures: list[str] = []
@@ -269,12 +270,20 @@ def cmd_eval(args: argparse.Namespace) -> int:
             failures.append(
                 f"decision p50 {p50:.2f}ms > {DECISION_LATENCY_ALARM_MS:.0f}ms"
             )
-        if failures:
+        if args.json and failures:
+            print(json.dumps({"gate": "failed", "failures": failures},
+                             indent=2))
+        elif args.json:
+            print(json.dumps({"gate": "passed"}, indent=2))
+        elif failures:
             print("CI gate FAILED: " + "; ".join(failures))
             return 1
-        print("CI gate passed "
-              f"(floor {args.quality_floor:.2f}, "
-              f"latency <{DECISION_LATENCY_ALARM_MS:.0f}ms)")
+        else:
+            print("CI gate passed "
+                  f"(floor {args.quality_floor:.2f}, "
+                  f"latency <{DECISION_LATENCY_ALARM_MS:.0f}ms)")
+        if failures:
+            return 1
     return 0
 
 
@@ -326,6 +335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="exit 1 when quality/latency gates fail")
     p.add_argument("--fail-on-misroute", action="store_true",
                    help="also fail when expected_model disagrees")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable report (CI artifact)")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_eval)
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .types import WorkloadClass, WorkloadSource
 
@@ -156,10 +156,25 @@ class SessionStore:
     def clear(self) -> None:
         self._sessions.clear()
 
-    def stats(self) -> dict[str, float]:
+    def stats(self) -> dict[str, Any]:
         if not self._sessions:
-            return {"sessions": 0.0, "switched": 0.0, "stranded": 0.0}
+            return {
+                "sessions": 0.0,
+                "switched": 0.0,
+                "stranded": 0.0,
+                "avg_hit_rate": 0.0,
+                "hit_rate_by_source": {},
+            }
         vals = list(self._sessions.values())
+        # Cache hit rate BY WORKLOAD SOURCE: if the hit rate for declared or
+        # fingerprint-routed traffic is not materially higher than for
+        # default-routed traffic, the inference layer is misrouting — and this
+        # is the metric that shows it.
+        by_source: dict[str, list[float]] = {}
+        for s in vals:
+            if s.observed_cache_hit_rate is not None:
+                by_source.setdefault(s.source.value, []).append(
+                    s.observed_cache_hit_rate)
         return {
             "sessions": float(len(vals)),
             "switched": float(sum(1 for s in vals if s.already_switched)),
@@ -167,6 +182,9 @@ class SessionStore:
             "avg_hit_rate": float(
                 sum(s.observed_cache_hit_rate or 0.0 for s in vals) / len(vals)
             ),
+            "hit_rate_by_source": {
+                k: sum(v) / len(v) for k, v in sorted(by_source.items())
+            },
         }
 
     def __len__(self) -> int:
