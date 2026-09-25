@@ -27,12 +27,18 @@ Pure decision layer (zero dependencies, no network)::
     decision = router.decide(request)
     decision.model_id, decision.backend_id, decision.ttl_by_segment
 
-The three things this package does that most routers do not:
+The things this package does that most routers do not:
   * scores **(model, backend) pairs**, so workload class and deployment class
     compose instead of being decided sequentially
   * treats **KV-cache state as a first-class routing signal**, learned from the
     provider's own usage counters rather than assumed
   * picks **TTL per prompt segment** (system/tools at 1h, history at 5m)
+  * learns **quality heads** from your feedback (`llmrouter train`) and blends
+    them with the priors via shrinkage — zero-dependency logistic inference,
+    identical in both runtimes from one JSON checkpoint
+  * streams (`Router.astream`), persists its learning across restarts
+    (`FileStateStore`), and serves the decision over HTTP for existing
+    gateways (`llmrouter serve`)
 """
 from __future__ import annotations
 
@@ -41,8 +47,10 @@ from .adapters import (
     Completion,
     ModelAdapter,
     OpenAIAdapter,
+    StreamEvent,
     Usage,
     adapter_for,
+    parse_sse_line,
 )
 from .affinity import (
     SessionPolicy,
@@ -78,6 +86,16 @@ from .economics import (
     prefix_cost,
     session_cost_with_switch,
 )
+from .learning import (
+    CHECKPOINT_FORMAT,
+    FEATURE_NAMES,
+    FeedbackSample,
+    ModelHead,
+    QualityModel,
+    extract_features,
+    load_feedback,
+    train_heads,
+)
 from .policy import PolicyEngine, RouterConfig, Weights
 from .pricing import (
     ANTHROPIC_CACHE,
@@ -89,7 +107,7 @@ from .pricing import (
     PriceRegistry,
     default_price_cards,
 )
-from .router import ConfigurationError, RetryPolicy, Router, RouterError
+from .router import ConfigurationError, RetryPolicy, Router, RouterError, StreamChunk
 from .signals import (
     AgentProfile,
     FingerprintRegistry,
@@ -98,6 +116,7 @@ from .signals import (
     WorkloadSignal,
     infer_structural,
 )
+from .store import FileStateStore, restore_snapshot, take_snapshot
 from .types import (
     Candidate,
     Constraints,
@@ -110,7 +129,7 @@ from .types import (
     WorkloadSource,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -190,5 +209,21 @@ __all__ = [
     "ModelAdapter",
     "Completion",
     "Usage",
+    "StreamEvent",
+    "parse_sse_line",
+    "StreamChunk",
     "adapter_for",
+    # learning
+    "CHECKPOINT_FORMAT",
+    "FEATURE_NAMES",
+    "QualityModel",
+    "ModelHead",
+    "FeedbackSample",
+    "extract_features",
+    "load_feedback",
+    "train_heads",
+    # state
+    "FileStateStore",
+    "take_snapshot",
+    "restore_snapshot",
 ]

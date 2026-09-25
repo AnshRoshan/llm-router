@@ -247,7 +247,7 @@ decision = router.decide(RoutingRequest(
 decision.model_id, decision.backend_id, decision.ttl_by_segment
 ```
 
-## The learning layer: `explain` / `calibrate` / `eval`
+## The learning layer: `explain` / `calibrate` / `eval` / `train` / `serve`
 
 A router you cannot interrogate is a router you cannot trust. The CLI runs the
 pure decision layer — no keys, no network:
@@ -256,6 +256,8 @@ pure decision layer — no keys, no network:
 python -m llmrouter explain --system "You are a support bot" --prompt "hi"
 python -m llmrouter eval --data cases.jsonl --ci --quality-floor 0.75
 python -m llmrouter calibrate --data cases.jsonl --target-strong-pct 0.5
+python -m llmrouter train --data feedback.jsonl --out quality.json
+python -m llmrouter serve --port 8787   # HTTP decide-sidecar for your gateway
 ```
 
 - **`explain`** routes one prompt and prints the full auditable decision —
@@ -350,6 +352,62 @@ The metric that matters most: **cache hit rate broken down by routing decision**
 If the hit rate for pinned sessions is not materially higher than for the rest,
 the affinity logic is not working. `stats()["sessions"]["hit_rate_by_source"]`
 breaks it down by how the workload class was learned.
+
+## Learned quality: `train` closes the loop
+
+The price-card `quality_prior` is a placeholder until you measure your own
+traffic. `llmrouter train` fits one logistic head per model from feedback
+JSONL (pointwise `{"text","model","outcome"}` or pairwise
+`{"text","model_a","model_b","winner"}` — including the rows
+`router.export_feedback()` writes from `report_feedback`) and emits a frozen
+checkpoint:
+
+```python
+from llmrouter import Router, QualityModel
+router = Router.with_defaults(anthropic_key=..., quality_model=QualityModel.load("quality.json"))
+```
+
+The blend is `quality = clamp(prior + λ·(b + w·x))` with `λ = n/(n+k)`:
+a model with no feedback behaves exactly like before; the learned delta only
+talks as loudly as its sample count earns. The feature vector is 17 bounded
+numbers derived from the request shape — the inference is 17 multiply-adds,
+so it stays inside the zero-dependency cold-path rule. The Node engine loads
+the same checkpoint and decides identically (asserted by `scripts/parity.mjs`).
+
+## Streaming
+
+`router.astream(...)` is the twin of `acomplete()`: it yields `StreamChunk`s —
+text deltas, then a final chunk carrying the `Completion` with the provider's
+real usage counters, so session affinity and the learning loop work on the
+stream path. Failover is honest about the boundary: an upstream failure is
+retried on the next backend **only while nothing has reached the caller**; a
+break after the first token raises instead of duplicating rendered text.
+
+## Durable state
+
+All learned state — session pins and hit-rate EWMAs, circuit health, prompt
+fingerprints, (lead, sidekick) pair economics — fits in one JSON snapshot:
+
+```python
+from llmrouter import Router, FileStateStore
+router = Router.with_defaults(..., state_store=FileStateStore("state.json"))
+# autosaves every 25 decisions; rebases TTLs on restore; router.save_state()
+# on shutdown
+```
+
+Without it, a restart converts a warm cache into a cold one the router thinks
+is cold. The format (`llmrouter-state-v1`) is shared with the Node engine, so
+replicas in either language can follow the same file.
+
+## The decide-sidecar (`serve`)
+
+Running your own gateway (LiteLLM, Bifrost, Envoy, your proxy)? Point it at
+`llmrouter serve`: `POST /decide` with a routing-request JSON body answers the
+full Decision (pair, TTLs, candidate scores, reasons); `GET /stats` and
+`GET /healthz` complete the surface. Binds localhost by default, `--token` for
+bearer auth, `--state` to keep affinity durable, and a following request's
+`observed_usage` feeds the provider counters back into the learned hit rate —
+decide with us, execute wherever.
 
 ## Other runtimes
 

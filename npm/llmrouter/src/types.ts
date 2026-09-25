@@ -8,7 +8,7 @@
  * keys) the digest differs between runtimes by design — a sticky key is only
  * ever compared within one process.
  */
-import { createHash } from "node:crypto";
+import { hash16 } from "./hash.js";
 
 // --------------------------------------------------------------------------- //
 // Enums
@@ -89,6 +89,9 @@ export interface Constraints {
   budgetRemainingUsd?: number | null;
   residencyTags?: ReadonlySet<string>;
   requireTools?: boolean;
+  /** Hard restriction on the candidate pool (the complement of
+   * AgentProfile.allowedModels, for caller-supplied restrictions). */
+  allowedModels?: ReadonlySet<string> | readonly string[] | null;
 }
 
 export const DEFAULT_CONSTRAINTS: Constraints = {};
@@ -176,6 +179,53 @@ export class RoutingRequest {
     if (first) return `ctx:${hash16(first)}`;
     return `fp:${this.promptFingerprint()}:${this.clientId ?? "anon"}`;
   }
+
+  /** Wire form for the HTTP decide endpoint — snake_case, mirrors Python
+   *  RoutingRequest.from_payload exactly. */
+  static fromPayload(obj: Record<string, any>): RoutingRequest {
+    const rawMessages = obj.messages;
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+      throw new Error("payload needs a non-empty 'messages' array");
+    }
+    const messages = rawMessages.map(
+      (m: any) => new Message(String(m.role ?? "user"), m.content ?? ""),
+    );
+    const workload = workloadFromName(obj.workload);
+    const c = obj.constraints ?? {};
+    const constraints: Constraints = {
+      maxCostUsd: c.max_cost_usd ?? null,
+      maxLatencyMs: c.max_latency_ms ?? null,
+      budgetRemainingUsd: c.budget_remaining_usd ?? null,
+      residencyTags: new Set<string>((c.residency_tags ?? []).map(String)),
+      requireTools: !!c.require_tools,
+      allowedModels: new Set<string>((c.allowed_models ?? []).map(String)),
+    };
+    return new RoutingRequest(
+      messages,
+      workload,
+      obj.session_id ?? null,
+      obj.agent_profile ?? null,
+      (obj.tools ?? []).map((t: any) => t as ToolSchema),
+      (obj.retrieved ?? []).map(String),
+      new Set<string>((obj.tags ?? []).map(String)),
+      constraints,
+      obj.expected_turns ?? null,
+      obj.expected_gap_s ?? null,
+      obj.expected_generation_s ?? null,
+      obj.client_id ?? null,
+    );
+  }
+}
+
+function workloadFromName(value: unknown): WorkloadClass | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const hit = (Object.values(WorkloadClass) as string[]).includes(value)
+    ? (value as WorkloadClass)
+    : null;
+  if (value.length > 0 && hit === null) {
+    throw new Error(`unknown workload ${JSON.stringify(value)}`);
+  }
+  return hit;
 }
 
 function stableJson(value: unknown): string {
@@ -191,9 +241,7 @@ function stableJson(value: unknown): string {
   });
 }
 
-function hash16(material: string): string {
-  return createHash("sha256").update(material, "utf8").digest().subarray(0, 16).toString("hex");
-}
+// hash16 comes from hash.js (pure SHA-256, runtime-agnostic).
 
 // --------------------------------------------------------------------------- //
 // Decisions
@@ -257,5 +305,32 @@ export class Decision {
     }
     for (const r of this.reasons) lines.push(`  · ${r}`);
     return lines.join("\n");
+  }
+
+  /** Wire form for the HTTP decide endpoint — mirrors Python
+   *  Decision.to_payload (snake_case, same candidate fields). */
+  toPayload(): Record<string, unknown> {
+    return {
+      model_id: this.modelId,
+      backend_id: this.backendId,
+      workload: this.workload,
+      workload_source: this.workloadSource,
+      workload_confidence: this.workloadConfidence,
+      sticky_key: this.stickyKey,
+      session_key: this.sessionKey,
+      is_first_turn: this.isFirstTurn,
+      reused_session: this.reusedSession,
+      switched: this.switched,
+      stranded: this.stranded,
+      ttl_by_segment: Object.fromEntries(this.ttlBySegment),
+      candidates: this.candidates.map((c) => ({
+        model_id: c.modelId, backend_id: c.backendId,
+        score: c.score, quality: c.quality,
+        cost_usd: c.costUsd, latency_ms: c.latencyMs,
+        affinity: c.affinity, switch_cost_usd: c.switchCostUsd,
+        reasons: [...c.reasons],
+      })),
+      reasons: [...this.reasons],
+    };
   }
 }

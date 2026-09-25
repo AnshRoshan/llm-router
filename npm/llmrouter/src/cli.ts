@@ -1,11 +1,14 @@
 /**
  * CLI: `npx llmrouter explain|eval|calibrate` — the pure decision layer,
- * no keys, no network. Mirrors `python -m llmrouter`.
+ * no keys, no network. Mirrors `python -m llmrouter`. `serve` delegates to
+ * the decide-sidecar (see serve.ts).
  */
 import { readFileSync } from "node:fs";
 import { PolicyEngine, type RouterConfig, type Weights } from "./policy.js";
 import { BackendRegistry, BackendSpec } from "./backends.js";
+import { QualityModel } from "./learning.js";
 import { PriceRegistry } from "./pricing.js";
+import { serveMain } from "./serve.js";
 import { WorkloadResolver } from "./signals.js";
 import {
   DeploymentClass,
@@ -16,7 +19,9 @@ import {
 
 const DECISION_LATENCY_ALARM_MS = 10.0;
 
-export function pureEngine(config?: RouterConfig): PolicyEngine {
+export function pureEngine(
+  config?: RouterConfig, qualityModel: QualityModel | null = null,
+): PolicyEngine {
   const prices = new PriceRegistry();
   const ids = prices.ids();
   const backends = new BackendRegistry([
@@ -31,7 +36,18 @@ export function pureEngine(config?: RouterConfig): PolicyEngine {
       priority: 1,
     }),
   ]);
-  return new PolicyEngine(prices, backends, new WorkloadResolver(), config);
+  return new PolicyEngine(
+    prices, backends, new WorkloadResolver(), config, null, qualityModel,
+  );
+}
+
+/** `--quality-model path` — a checkpoint trained by `python -m llmrouter train`. */
+export function qualityModelFrom(
+  args: Map<string, string>,
+): QualityModel | null {
+  const path = args.get("quality-model");
+  if (!path) return null;
+  return QualityModel.fromJson(JSON.parse(readFileSync(path, "utf8")));
 }
 
 interface CaseMeta {
@@ -95,7 +111,7 @@ function cmdExplain(args: Map<string, string>): number {
     workload ? WorkloadClass[capitalize(workload) as keyof typeof WorkloadClass] : null,
     args.get("session-id") ?? null,
   );
-  console.log(pureEngine().decide(req).explain());
+  console.log(pureEngine(undefined, qualityModelFrom(args)).decide(req).explain());
   return 0;
 }
 
@@ -105,7 +121,7 @@ function cmdEval(args: Map<string, string>, flags: Set<string>): number {
   const engine = pureEngine({
     ...base,
     weights: { ...base.weights, minQuality } as Weights,
-  });
+  }, qualityModelFrom(args));
   const cases = loadCases(args.get("data")!);
   const qualityFloor = Number(args.get("quality-floor") ?? 0.75);
   const ci = flags.has("ci");
@@ -132,7 +148,10 @@ function cmdEval(args: Map<string, string>, flags: Set<string>): number {
     engine.decide(req);
     latencies.push(Number(process.hrtime.bigint() - t0) / 1e6);
     const card = engine.prices.require(decision.modelId);
-    const q = card.quality(decision.workload);
+    const chosen = decision.candidates.find(
+      (c) => c.modelId === decision.modelId && c.backendId === decision.backendId,
+    );
+    const q = chosen ? chosen.quality : card.quality(decision.workload);
     qualities.push(q);
     if (decision.candidates.length > 0) costs += decision.candidates[0].costUsd;
     mix[decision.modelId] = (mix[decision.modelId] ?? 0) + 1;
@@ -262,10 +281,12 @@ export function runCli(argv: string[]): number {
           return 2;
         }
         return cmdCalibrate(args);
+      case "serve":
+        return serveMain(rest);
       default:
         console.error(
           "llmrouter — cache-aware LLM routing (decision engine)\n" +
-            "usage: llmrouter <explain|eval|calibrate> [options]",
+            "usage: llmrouter <explain|eval|calibrate|serve> [options]",
         );
         return command ? 2 : 0;
     }

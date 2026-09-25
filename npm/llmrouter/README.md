@@ -7,7 +7,13 @@ prompt-cache TTL **per breakpoint**. **Zero runtime dependencies.**
 This is the decision engine of the Python
 [`llmrouter`](../../llmrouter) package, ported 1:1: same price cards, same
 formulas (`R*` amortization, `E*` expiry threshold, TTL policy), same scoring.
-The two runtimes make the **same decision** for the same request.
+The two runtimes make the **same decision** for the same request — including
+when a **learned quality checkpoint** (`llmrouter train` on the Python side)
+is loaded: `QualityModel.fromJson(...)` consumes it here and the parity suite
+asserts identical output. State snapshots (`llmrouter-state-v1`) are also
+cross-runtime: `loadSnapshotFile` / `saveSnapshotFile` restore sessions, hit
+rates and circuit health from either language. `npx llmrouter serve` runs the
+same HTTP decide-sidecar as Python (`POST /decide`).
 
 ```bash
 npm install llmrouter

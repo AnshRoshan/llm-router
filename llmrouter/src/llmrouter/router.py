@@ -12,11 +12,20 @@ async path with the optional httpx extra.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from collections import deque
 from dataclasses import dataclass, replace
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
-from .adapters import Completion, ModelAdapter, Usage, adapter_for
+from .adapters import (
+    Completion,
+    ModelAdapter,
+    Usage,
+    _merge_usage,
+    adapter_for,
+    parse_sse_line,
+)
 from .affinity import SessionPolicy, SessionStore
 from .delegation import (
     Brief,
@@ -29,9 +38,11 @@ from .delegation import (
 )
 from .backends import BackendRegistry, BackendSpec
 from .economics import emit_breakpoints
+from .learning import QualityModel
 from .policy import PolicyEngine, RouterConfig
 from .pricing import PriceRegistry
 from .signals import AgentProfile, FingerprintRegistry, WorkloadClassifier, WorkloadResolver
+from .store import FileStateStore
 from .types import (
     Decision,
     DeploymentClass,
@@ -68,6 +79,18 @@ class ConfigurationError(RouterError):
     """
 
 
+@dataclass(frozen=True)
+class StreamChunk:
+    """One item from `Router.astream()`.
+
+    Text chunks carry a `text` delta; the FINAL chunk carries the completed
+    `Completion` with the provider's real usage counters.
+    """
+
+    text: str = ""
+    completion: Completion | None = None
+
+
 class Router:
     """Cache-aware LLM router.
 
@@ -89,6 +112,8 @@ class Router:
         pairs: PairRegistry | None = None,
         sidekick_model: str | None = None,
         lead_model: str | None = None,
+        quality_model: QualityModel | None = None,
+        state_store: FileStateStore | None = None,
     ) -> None:
         self.prices = prices
         self.backends = backends
@@ -121,16 +146,25 @@ class Router:
         self.engine = PolicyEngine(
             prices, self.backends, self.resolver, self.config,
             pairs=self.pairs, lead_model=self.lead_model,
+            quality_model=quality_model,
         )
         self._cost_usd = 0.0
         self._decisions = 0
         self._misroutes = 0
         self._delegations = 0
         self._last_decision: Decision | None = None
+        self._last_user_text = ""
+        #: Feedback records awaiting training (the learning loop's outbox).
+        #: Bounded so a long-running router cannot grow it without limit; the
+        #: oldest records are the least relevant when the traffic mix shifts.
+        self._feedback: deque[dict[str, object]] = deque(maxlen=10_000)
         #: Attempts the last acomplete() needed (1 = first try). Delegated
         #: tasks fold this into pair economics: more attempts => a sidekick
         #: that needs more correction rounds => costlier as a partner.
         self._last_attempts: int = 1
+        self._state_store: FileStateStore | None = None
+        if state_store is not None:
+            state_store.attach(self)
 
     # ------------------------------------------------------------------ #
     # sidekick pin — derived state, kept in sync via a property so the pin
@@ -169,6 +203,8 @@ class Router:
         profiles: Mapping[str, AgentProfile] | None = None,
         classifier: WorkloadClassifier | None = None,
         default_workload: WorkloadClass = WorkloadClass.CHAT,
+        quality_model: QualityModel | None = None,
+        state_store: FileStateStore | None = None,
     ) -> "Router":
         """Decision-only router over the bundled defaults: no keys, no network.
 
@@ -199,6 +235,8 @@ class Router:
                 default_workload=default_workload,
             ),
             config=config,
+            quality_model=quality_model,
+            state_store=state_store,
         )
 
     @classmethod
@@ -217,6 +255,8 @@ class Router:
         lead_model: str | None = None,
         delegation: DelegationPolicy | None = None,
         pairs: PairRegistry | None = None,
+        quality_model: QualityModel | None = None,
+        state_store: FileStateStore | None = None,
     ) -> "Router":
         """Sensible starting point: the bundled price cards plus one backend per
         provider you supplied a key for.
@@ -263,6 +303,8 @@ class Router:
             lead_model=lead_model,
             delegation=delegation,
             pairs=pairs,
+            quality_model=quality_model,
+            state_store=state_store,
         )
         router._keys = {"anthropic": anthropic_key, "openai": openai_key}  # type: ignore[attr-defined]
         return router
@@ -279,6 +321,7 @@ class Router:
         session = self.sessions.get(req.sticky_key())
         decision = self.engine_decide(req, session)
         self._last_decision = decision
+        self._last_user_text = req.first_user_text()
         return decision
 
     def engine_decide(self, req: RoutingRequest,
@@ -412,6 +455,158 @@ class Router:
         ) from last_error
 
     # ------------------------------------------------------------------ #
+    async def astream(
+        self,
+        messages: Sequence[Message] | Sequence[Mapping[str, Any]],
+        *,
+        workload: WorkloadClass | str | None = None,
+        session_id: str | None = None,
+        agent_profile: str | None = None,
+        tools: Sequence[Mapping[str, Any]] = (),
+        retrieved: Sequence[str] = (),
+        tags: Sequence[str] = (),
+        expected_turns: int | None = None,
+        expected_gap_s: float | None = None,
+        expected_generation_s: float | None = None,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> "AsyncIterator[StreamChunk]":
+        """Streaming variant of `acomplete()`: yields `StreamChunk`s.
+
+        Each chunk carries a `text` delta; the LAST chunk carries the finished
+        `completion` with real usage counters, so the learning loop and session
+        affinity work exactly as they do on the unary path.
+
+        Failover rule: an upstream failure is retried on the next backend only
+        while nothing has reached the caller. Once the first token has been
+        yielded, a break is raised — silently restarting mid-stream would
+        duplicate text the caller already rendered.
+        """
+        req = self._to_request(
+            messages,
+            workload=workload, session_id=session_id, agent_profile=agent_profile,
+            tools=tools, retrieved=retrieved, tags=tags,
+            expected_turns=expected_turns, expected_gap_s=expected_gap_s,
+            expected_generation_s=expected_generation_s,
+        )
+        decision = self.decide(req)
+        card = self.prices.require(decision.model_id)
+        sem = card.cache
+        prefix_tokens = self.engine.estimate_prefix_tokens(req)
+        segment_tokens = self.engine.segment_tokens(req, prefix_tokens)
+        breakpoints = emit_breakpoints(sem, segment_tokens, decision.ttl_by_segment)
+
+        if self.transport is None or not hasattr(self.transport, "stream"):
+            raise ConfigurationError(
+                "no streaming transport — pass an httpx.AsyncClient "
+                "(client.stream is used), or use acomplete()/decide()"
+            )
+
+        attempts: list[str] = []
+        last_error: Exception | None = None
+
+        for attempt in range(self.retry.max_attempts):
+            backend = self.backends.spec(decision.backend_id)
+            if backend is None:
+                attempts.append(f"{decision.backend_id}: no such backend")
+                break
+            health = self.backends.health(backend.backend_id)
+            if health.is_half_open():
+                health.half_open_probes += 1
+            health.in_flight += 1
+            yielded = False
+            parts: list[str] = []
+            usage: Usage | None = None
+            started = time.monotonic()
+            try:
+                adapter, url, headers, body = self._prepare_call(
+                    backend, decision, req, breakpoints, max_tokens, kwargs,
+                    stream=True,
+                )
+                completion: Completion | None = None
+                try:
+                    ctx = self.transport.stream(
+                        "POST", url, headers=headers, json=dict(body),
+                        timeout=backend.timeout_s,
+                    )
+                    async with ctx as resp:
+                        status = getattr(resp, "status_code", 200)
+                        if status >= 400:
+                            raise RouterError(
+                                f"HTTP {status} from {backend.backend_id}")
+                        async for line in resp.aiter_lines():
+                            event = parse_sse_line(line)
+                            if event is None:
+                                continue
+                            se = adapter.parse_stream_event(event)
+                            usage = _merge_usage(usage, se.usage)
+                            if se.text_delta:
+                                yielded = True
+                                parts.append(se.text_delta)
+                                yield StreamChunk(text=se.text_delta)
+                finally:
+                    health.in_flight = max(0, health.in_flight - 1)
+                latency_ms = (time.monotonic() - started) * 1000.0
+                usage = usage or Usage()
+                completion = Completion(
+                    text="".join(parts), usage=usage,
+                    model=usage.model or decision.model_id,
+                    backend_id=backend.backend_id, latency_ms=latency_ms,
+                )
+            except ConfigurationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — re-raised after the chain
+                last_error = exc
+                retry_after = _retry_after(exc)
+                health.record_failure(str(exc), retry_after_s=retry_after)
+                attempts.append(f"{backend.backend_id}: {exc}")
+                if yielded:
+                    raise RouterError(
+                        f"stream broke after the first token from "
+                        f"{backend.backend_id}", attempts=attempts
+                    ) from exc
+                nxt = self._next_backend(decision, req, exclude=backend.backend_id)
+                if nxt is None:
+                    redecided = self._redecide_excluding(req, decision.model_id)
+                    if redecided is None:
+                        break
+                    decision = redecided
+                    attempts.append(
+                        f"re-decided to {decision.model_id}@{decision.backend_id}"
+                    )
+                    await asyncio.sleep(
+                        min(self.retry.base_backoff_s * (2 ** attempt),
+                            self.retry.max_backoff_s)
+                    )
+                    continue
+                decision = replace(
+                    decision, backend_id=nxt,
+                    reasons=decision.reasons + (f"failed over to {nxt}",),
+                )
+                await asyncio.sleep(
+                    min(self.retry.base_backoff_s * (2 ** attempt),
+                        self.retry.max_backoff_s)
+                )
+                continue
+            assert completion is not None
+            health.record_success(latency_ms)
+            self._learn(decision, completion.usage, req)
+            self._last_attempts = attempt + 1
+            self._last_decision = replace(
+                decision,
+                cache_read_tokens=completion.usage.cache_read_tokens,
+                cache_write_tokens=completion.usage.cache_write_tokens,
+                latency_ms=completion.latency_ms,
+            )
+            yield StreamChunk(completion=completion)
+            return
+
+        raise RouterError(
+            f"all {len(attempts)} attempt(s) failed for workload="
+            f"{decision.workload.value}", attempts=attempts
+        ) from last_error
+
+    # ------------------------------------------------------------------ #
     def _to_request(self, messages, **kw) -> RoutingRequest:
         norm: list[Message] = []
         for m in messages:
@@ -434,9 +629,10 @@ class Router:
             **kw,
         )
 
-    async def _call(self, backend: BackendSpec, decision: Decision,
-                    req: RoutingRequest, breakpoints, max_tokens: int,
-                    kwargs: Mapping[str, Any]) -> Completion:
+    def _prepare_call(self, backend: BackendSpec, decision: Decision,
+                      req: RoutingRequest, breakpoints, max_tokens: int,
+                      kwargs: Mapping[str, Any], *, stream: bool = False
+                      ) -> tuple[ModelAdapter, str, dict[str, str], Mapping[str, Any]]:
         if self.transport is None:
             raise ConfigurationError(
                 "no transport configured — install llmrouter[http] and pass an "
@@ -446,6 +642,9 @@ class Router:
         card = self.prices.require(decision.model_id)
         key_param = card.cache.explicit_cache_key_param
 
+        extra: dict[str, Any] = dict(kwargs)
+        if stream:
+            extra["stream"] = True
         body = adapter.build_body(
             req.messages,
             tools=req.tools,
@@ -453,10 +652,19 @@ class Router:
             model=decision.model_id,
             cache_key=decision.sticky_key if key_param else None,
             max_tokens=max_tokens,
-            **dict(kwargs),
+            **extra,
         )
         headers = self._headers(backend)
+        if stream:
+            headers["accept"] = "text/event-stream"
         url = f"{(backend.base_url or '').rstrip('/')}{getattr(adapter, 'path', '')}"
+        return adapter, url, headers, body
+
+    async def _call(self, backend: BackendSpec, decision: Decision,
+                    req: RoutingRequest, breakpoints, max_tokens: int,
+                    kwargs: Mapping[str, Any]) -> Completion:
+        adapter, url, headers, body = self._prepare_call(
+            backend, decision, req, breakpoints, max_tokens, kwargs)
         started = time.monotonic()
         resp = await self.transport.post(
             url, headers=headers, json=dict(body), timeout=backend.timeout_s
@@ -602,6 +810,30 @@ class Router:
     # ------------------------------------------------------------------ #
     # LEARNING
     # ------------------------------------------------------------------ #
+    def note_usage(self, req: RoutingRequest, usage: Usage) -> None:
+        """Fold provider usage counters from a call YOU made into session state.
+
+        The sidecar (`llmrouter serve`) and callers driving their own HTTP
+        client use this to keep the learned hit rate alive without the
+        `acomplete()` execution layer: decide with us, execute wherever, report
+        the counters back on the next turn.
+        """
+        session = self.sessions.peek(req.sticky_key())
+        if session is None:
+            return  # no session yet: nothing to attribute the counters to
+        session.record_usage(usage.cache_read_tokens, usage.cache_write_tokens)
+        self.sessions.put(session)
+
+    def note_decision(self, req: RoutingRequest, decision: Decision) -> None:
+        """Pin the session for a decision the CALLER executed.
+
+        The decide-side counterpart of `_learn`: without it, a pure-decision
+        consumer (HTTP sidecar, LiteLLM plugin) never builds session state and
+        every turn scores cold. Usage counters arrive separately via
+        `note_usage` on the following turn.
+        """
+        self._learn(decision, Usage(), req)
+
     def _learn(self, decision: Decision, usage: Usage, req: RoutingRequest) -> None:
         """Fold the provider's usage counters back into session state.
 
@@ -640,12 +872,67 @@ class Router:
                 + card.output_cost(usage.output_tokens)
             )
         self._decisions += 1
+        if self._state_store is not None:
+            self._state_store.tick(self)
 
-    def report_feedback(self, session_id: str, *, misrouted: bool) -> None:
-        """Record a human/eval judgement. Feeds the misroute→training-example
-        pipeline; `misrouted` sessions are the ones worth learning from."""
+    # ------------------------------------------------------------------ #
+    # DURABLE STATE
+    # ------------------------------------------------------------------ #
+    def save_state(self) -> None:
+        """Explicit snapshot write (the autosave covers steady traffic; this
+        covers shutdown hooks and graceful deploys)."""
+        if self._state_store is not None:
+            self._state_store.save(self)
+
+    def load_state(self) -> bool:
+        """Restore a snapshot, rebasing every timestamp onto this process's
+        monotonic clock. Returns False when no snapshot exists yet."""
+        return self._state_store.load(self) if self._state_store else False
+
+    def report_feedback(self, session_id: str, *, misrouted: bool,
+                        expected_model: str | None = None) -> None:
+        """Record a human/eval judgement.
+
+        This closes the loop: every report becomes a training sample for the
+        learned quality heads (`export_feedback` -> `llmrouter train` ->
+        `QualityModel.load` -> pass it back to the Router). `expected_model`
+        turns the pair (expected, chosen) into a preference row automatically.
+        """
         if misrouted:
             self._misroutes += 1
+        session = self.sessions.peek(f"sid:{session_id}")
+        chosen = session.pinned_model if session else (
+            self._last_decision.model_id if self._last_decision else None
+        )
+        if chosen is None:
+            return  # nothing to attribute the judgement to
+        workload = session.workload if session else (
+            self._last_decision.workload if self._last_decision else None
+        )
+        row: dict[str, object] = {
+            "text": self._last_user_text,
+            "session_id": session_id,
+        }
+        if workload is not None:
+            row["workload"] = workload.value
+        if expected_model and misrouted:
+            row.update({"model_a": expected_model, "model_b": chosen,
+                        "winner": "a"})
+        else:
+            row.update({"model": chosen, "outcome": 0 if misrouted else 1})
+        self._feedback.append(row)
+
+    def export_feedback(self, path: str | None = None) -> str:
+        """Serialize collected feedback as training JSONL (to `path` if given).
+        Feed the result to `llmrouter train --data <file>`."""
+        text = "\n".join(json.dumps(r, sort_keys=True) for r in self._feedback)
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + ("\n" if text else ""))
+        return text
+
+    def feedback_count(self) -> int:
+        return len(self._feedback)
 
     # ------------------------------------------------------------------ #
     def stats(self) -> dict[str, Any]:
@@ -706,4 +993,4 @@ def _retry_after(exc: Exception) -> float | None:
 
 
 __all__ = ["Router", "RetryPolicy", "RouterError", "ConfigurationError",
-           "DEFAULT_MAX_ATTEMPTS"]
+           "StreamChunk", "DEFAULT_MAX_ATTEMPTS"]

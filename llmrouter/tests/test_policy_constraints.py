@@ -9,6 +9,7 @@ import time
 import pytest
 
 from llmrouter import (
+    AgentProfile,
     BackendRegistry,
     BackendSpec,
     Constraints,
@@ -221,7 +222,7 @@ def test_router_pure_decides_without_keys_or_network():
 
 
 def test_session_stats_report_hit_rate_by_workload_source():
-    from llmrouter import SessionStore, WorkloadSource
+    from llmrouter import AgentProfile, SessionStore, WorkloadSource
 
     store = SessionStore()
     s = SessionPolicy(
@@ -235,3 +236,35 @@ def test_session_stats_report_hit_rate_by_workload_source():
     stats = store.stats()
     assert stats["hit_rate_by_source"]["fingerprint"] == pytest.approx(0.9)
     assert stats["avg_hit_rate"] == pytest.approx(0.9)
+
+
+# --------------------------------------------------------------------------- #
+# Constraints.allowed_models — caller-supplied pool restriction
+# --------------------------------------------------------------------------- #
+def test_allowed_models_constraint_restricts_pool():
+    engine = make_engine()
+    d = engine.decide(RoutingRequest(
+        messages=(Message("user", "hi"),),
+        workload=WorkloadClass.CHAT,
+        constraints=Constraints(allowed_models=frozenset(
+            {"claude-haiku-class", "claude-sonnet-class"})),
+    ))
+    assert d.model_id in ("claude-haiku-class", "claude-sonnet-class")
+    assert all("claude" in c.model_id for c in d.candidates)
+
+
+def test_allowed_models_intersected_with_profile():
+    engine = make_engine()
+    engine.resolver.add_profile(AgentProfile(
+        name="p", workload=WorkloadClass.CHAT,
+        allowed_models=("claude-haiku-class", "claude-sonnet-class"),
+    ))
+    # Intersection of profile and request pool is empty: nothing is routable,
+    # and the engine must say so clearly instead of silently ignoring a side.
+    with pytest.raises(RuntimeError, match="no models available"):
+        engine.decide(RoutingRequest(
+            messages=(Message("user", "hi"),),
+            workload=WorkloadClass.CHAT,
+            agent_profile="p",
+            constraints=Constraints(allowed_models=frozenset({"gpt-mini-class"})),
+        ))

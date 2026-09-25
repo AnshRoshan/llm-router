@@ -144,6 +144,11 @@ class SessionStore:
         oldest = min(self._sessions.values(), key=lambda s: s.last_seen)
         self._sessions.pop(oldest.session_key, None)
 
+    def peek(self, session_key: str) -> SessionPolicy | None:
+        """Read without side effects: `get` counts a turn, which would let
+        feedback/inspection calls silently age a session."""
+        return self._sessions.get(session_key)
+
     def extend(self, session_key: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
         sess = self._sessions.get(session_key)

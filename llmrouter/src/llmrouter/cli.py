@@ -1,6 +1,6 @@
 """Command-line surface: the learning layer's minimum viable loop.
 
-Three commands, all running the PURE decision layer (no network, no keys):
+Five commands, all running the PURE decision layer (no network, no keys):
 
   explain     route one prompt and print the full auditable decision
   calibrate   sweep the quality floor to hit a target strong-model share
@@ -8,6 +8,11 @@ Three commands, all running the PURE decision layer (no network, no keys):
   eval        run a labeled case file, report quality/cost/mix/latency,
               and — with --ci — exit non-zero when quality drops below
               the floor (the pre-merge gate)
+  train       fit logistic quality heads from feedback JSONL and write a
+              checkpoint the engines load (the offline half of the loop)
+  serve       expose the same decision over HTTP for LiteLLM/Bifrost/custom
+              gateways (POST /decide -> Decision JSON; the serve module owns
+              this one)
 
 Case file format: one JSON object per line. Shorthand is `{"text": "..."}`;
 full form is `{"messages": [...], "workload": "chat", "session_id": "s1",
@@ -23,6 +28,7 @@ import sys
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
+from .learning import QualityModel, load_feedback, train_heads
 from .policy import PolicyEngine, RouterConfig, Weights
 from .router import Router
 from .types import Message, RoutingRequest, WorkloadClass
@@ -35,10 +41,16 @@ DECISION_LATENCY_ALARM_MS = 10.0
 # --------------------------------------------------------------------------- #
 # A pure decision engine over the bundled defaults
 # --------------------------------------------------------------------------- #
-def pure_engine(config: RouterConfig | None = None) -> PolicyEngine:
+def pure_engine(config: RouterConfig | None = None,
+                quality_model: QualityModel | None = None) -> PolicyEngine:
     """Decision-only engine: bundled price cards, one logical backend per
     provider, no keys and no network. This is what the CLI runs on."""
-    return Router.pure(config=config).engine
+    return Router.pure(config=config, quality_model=quality_model).engine
+
+
+def _quality_model_from(args: argparse.Namespace) -> QualityModel | None:
+    path = getattr(args, "quality_model", None)
+    return QualityModel.load(path) if path else None
 
 
 def build_request(args: argparse.Namespace) -> RoutingRequest:
@@ -126,7 +138,7 @@ def _strong_models(engine: PolicyEngine, workload: WorkloadClass) -> set[str]:
 # explain
 # --------------------------------------------------------------------------- #
 def cmd_explain(args: argparse.Namespace) -> int:
-    engine = pure_engine()
+    engine = pure_engine(quality_model=_quality_model_from(args))
     decision = engine.decide(build_request(args))
     print(decision.explain())
     return 0
@@ -194,7 +206,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 def cmd_eval(args: argparse.Namespace) -> int:
     base = pure_engine().config
     engine = pure_engine(RouterConfig(
-        weights=replace(base.weights, min_quality=args.min_quality)))
+        weights=replace(base.weights, min_quality=args.min_quality)),
+        quality_model=_quality_model_from(args))
     cases = load_cases(args.data)
     if not cases:
         print("no cases found in", args.data, file=sys.stderr)
@@ -220,7 +233,12 @@ def cmd_eval(args: argparse.Namespace) -> int:
         # is pure and deterministic — the reported number is real wall-clock.
         latencies.append(_measure_decide(engine, req))
         card = engine.prices.require(d.model_id)
-        q = card.quality(d.workload.value)
+        chosen = next(
+            (c for c in d.candidates
+             if c.model_id == d.model_id and c.backend_id == d.backend_id),
+            None,
+        )
+        q = chosen.quality if chosen else card.quality(d.workload.value)
         qualities.append(q)
         costs += d.candidates[0].cost_usd if d.candidates else 0.0
         mix[d.model_id] = mix.get(d.model_id, 0) + 1
@@ -295,6 +313,41 @@ def _measure_decide(engine: PolicyEngine, req: RoutingRequest) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# train — the feedback loop's offline half
+# --------------------------------------------------------------------------- #
+def cmd_train(args: argparse.Namespace) -> int:
+    samples = load_feedback(args.data)
+    if not samples:
+        print("no feedback samples found in", args.data, file=sys.stderr)
+        return 2
+    model, reports = train_heads(
+        samples, epochs=args.epochs, lr=args.lr, l2=args.l2,
+        holdout=args.holdout, min_samples=args.min_samples, seed=args.seed,
+        shrinkage_k=args.shrinkage_k,
+    )
+    if not reports:
+        print(f"no model reached min_samples={args.min_samples} — the "
+              "checkpoint is empty and every decision keeps its prior",
+              file=sys.stderr)
+    if not args.quiet:
+        print(f"samples: {len(samples)}  heads trained: {len(reports)}\n")
+        print(f"{'model':>24} {'n':>5} {'mean y':>7} "
+              f"{'train acc':>9} {'eval acc':>9}")
+        for r in sorted(reports, key=lambda r: r.model_id):
+            ev = f"{r.eval_accuracy:.3f}" if r.eval_accuracy is not None else "  n/a"
+            print(f"{r.model_id:>24} {r.samples:>5} {r.mean_outcome:>7.3f} "
+                  f"{r.train_accuracy:>9.3f} {ev:>9}")
+        print(f"\nmax shrinkage lambda (trust in the learned delta at the "
+              f"best-sampled head): "
+              f"{max((h.samples / (h.samples + model.shrinkage_k) for h in model.heads.values()), default=0.0):.2f}")
+    model.save(args.out)
+    print(f"wrote {len(model.heads)} quality head(s) -> {args.out}")
+    print('use it: Router.with_defaults(quality_model=QualityModel.load('
+          f'"{args.out}"))')
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m llmrouter",
@@ -311,6 +364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--session-id", default=None)
     p.add_argument("--tools", default=None,
                    help="path to a JSON array of tool schemas")
+    p.add_argument("--quality-model", default=None,
+                   help="quality checkpoint from `llmrouter train`")
     p.set_defaults(func=cmd_explain)
 
     p = sub.add_parser("calibrate",
@@ -338,7 +393,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--json", action="store_true",
                    help="machine-readable report (CI artifact)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--quality-model", default=None,
+                   help="score with trained quality heads from a checkpoint")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("train",
+                       help="fit per-model logistic quality heads from "
+                            "feedback JSONL and write a checkpoint")
+    p.add_argument("--data", required=True,
+                   help="feedback JSONL ('-' for stdin); rows are pointwise "
+                        "(model+outcome) or pairwise (model_a+model_b+winner)")
+    p.add_argument("--out", default="quality.json")
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--lr", type=float, default=0.25)
+    p.add_argument("--l2", type=float, default=1e-4)
+    p.add_argument("--holdout", type=float, default=0.2)
+    p.add_argument("--min-samples", type=int, default=8,
+                   help="models below this sample count keep the prior")
+    p.add_argument("--shrinkage-k", type=float, default=20.0)
+    p.add_argument("--seed", type=int, default=13)
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("serve",
+                       help="run the decision engine as an HTTP decide-sidecar "
+                            "(POST /decide, GET /stats, GET /healthz)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--token", default=None,
+                   help="require Authorization: Bearer <token>")
+    p.add_argument("--quality-model", default=None,
+                   help="score with trained quality heads from a checkpoint")
+    p.add_argument("--state", default=None,
+                   help="JSON file for durable session/health state")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=_cmd_serve)
 
     args = parser.parse_args(argv)
     try:
@@ -346,6 +435,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .serve import cmd_serve
+    return cmd_serve(args)
 
 
 __all__ = ["main", "pure_engine", "load_cases", "build_request"]

@@ -7,6 +7,8 @@
 <meta name="description" content="llmrouter picks the (model, backend) pair, keeps sessions sticky so the prompt cache survives, and chooses prompt-cache TTL per breakpoint. Python and Node.js, zero dependencies.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230B0F14'/%3E%3Cpath d='M6 16h8m0 0 4-6h8m-12 6 4 6h8' stroke='%233B82F6' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
+<!-- The real decision engine (npm package, bundled). Must run before script.js. -->
+<script src="assets/llmrouter-demo.js" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -20,6 +22,7 @@
     <nav aria-label="Main">
       <a href="#why">Why</a>
       <a href="#quickstart">Quick start</a>
+      <a href="#demo">Live demo</a>
       <a href="#concepts">Concepts</a>
       <a href="#cli">CLI</a>
       <a href="#packages">Packages</a>
@@ -153,11 +156,88 @@ console.log(decision.explain());</code></pre>
   </div>
 </section>
 
+<!-- ============================= LIVE DEMO ============================= -->
+<section id="demo" class="section">
+  <div class="container">
+    <h2>Route something, right here</h2>
+    <p class="section-sub">This is not a mockup: the form below runs the actual
+    <code>llmrouter</code> decision engine (the same TypeScript modules published to npm)
+    in your browser, against the bundled price cards. No network, no keys. Keep the session id
+    and route twice to watch the cache warm up. Raise the idle gap past five minutes and,
+    when the winner is an Anthropic-backed model, the system segment steps up to the 1-hour tier;
+    OpenAI-backed picks have no explicit TTL tiers at all, and the chips show exactly that.</p>
+
+    <div class="demo-grid">
+      <div class="demo-controls">
+        <label for="demo-prompt">User message</label>
+        <textarea id="demo-prompt" rows="3" spellcheck="false">I was charged twice for my subscription this month, how do I get a refund?</textarea>
+
+        <label for="demo-workload">Workload class</label>
+        <select id="demo-workload">
+          <option value="auto" selected>auto (infer it)</option>
+          <option value="Chat">chat</option>
+          <option value="Code">code</option>
+          <option value="Rag">rag</option>
+          <option value="Agent">agent</option>
+          <option value="Batch">batch</option>
+          <option value="Vision">vision</option>
+        </select>
+
+        <label for="demo-session">Session id <span class="dim">(stickiness)</span></label>
+        <input id="demo-session" type="text" value="demo-session" spellcheck="false">
+
+        <label for="demo-pool">Candidate pool <span class="dim">(Anthropic-backed models carry the explicit 1h TTL tier)</span></label>
+        <select id="demo-pool">
+          <option value="all" selected>all models</option>
+          <option value="anthropic">Anthropic-backed only</option>
+          <option value="openai">OpenAI-backed only</option>
+        </select>
+
+        <label for="demo-gap">Expected idle gap between turns, seconds <span class="dim">(TTL policy)</span></label>
+        <input id="demo-gap" type="number" min="0" step="30" value="90">
+
+        <label for="demo-system">System prompt <span class="dim">(the cacheable prefix; long enough to clear the provider's 1,024-token cache minimum)</span></label>
+        <textarea id="demo-system" rows="6" spellcheck="false">You are a senior support engineer for a payments platform. Answer with the relevant policy, the exact next steps, and the API calls required. Cite the policy id for every claim.
+
+REFUND POLICY (POL-101): Duplicate charges are refunded in full within 30 days of the second capture. Partial refunds follow the merchant agreement section 4.2. Refunds over $500 require a dispute-engineering review before submission. Process refunds against the original payment intent, never a new one, or reconciliation will double-count the payout.
+
+DISPUTE POLICY (POL-114): Chargebacks must be answered within 7 days. Gather: capture timestamp, AVS result, CVV match, device fingerprint, and prior refund history. Write the evidence narrative in neutral, factual language; never speculate about customer intent in writing.
+
+API CONVENTIONS (API-009): All list endpoints paginate with cursor= and limit= (max 100). Idempotency keys are required on every POST that moves money; reuse the same key for exactly one logical operation. Errors arrive as { error: { type, code, message, request_id } }; always surface request_id to the caller for tracing.
+
+RATE LIMITS (OPS-020): Default 100 requests/second per key, burst 200. On 429, retry with exponential backoff and honor Retry-After. Sustained saturation for 5 minutes trips an automatic key review.
+
+DATA HANDLING (SEC-041): Never echo full card numbers, bank account numbers, or government identifiers back to the caller; mask to the last four. PII stays inside this conversation and is never quoted into external tickets. Logs reference customers by customer_id only.
+
+ESCALATION (POL-121): Escalate to a human reviewer when: the disputed amount exceeds $500, the customer mentions legal action or regulators, the account has three or more disputes in 90 days, or you are uncertain which policy applies. State the escalation reason explicitly and hand over a summary the reviewer can act on without re-reading the thread.
+
+TONE (POL-002): Be concise: no more than 150 words unless the caller asks for a full walkthrough. Lead with the answer, then the steps, then the citation. No apologies chains; one acknowledgment maximum.
+
+CHARGEBACK EVIDENCE CHECKLIST (POL-115): Assemble in this order and nothing else: (1) proof of authorization: AVS result, CVV match status, 3DS liability shift indicator; (2) proof of delivery: carrier tracking with delivered status and address match, or access logs for digital goods; (3) proof of usage: login timestamps after the disputed charge, API calls made with the purchased quota; (4) prior communication: refund offers made, acknowledgments of receipt by the customer. Attach raw logs as plain text, never screenshots; the network needs machine-readable evidence.
+
+SETTLEMENT AND PAYOUTS (FIN-033): Payouts run on a 2-business-day rolling schedule. Weekends and bank holidays delay, never accelerate, a payout. A refund issued against a capture in a prior payout cycle nets against the current cycle balance; explain this to merchants who ask why a payout is smaller than expected. Negative balances offset against future sales for 90 days before we invoice.
+
+SUBSCRIPTIONS (SUB-050): Proration is calculated to the second, billed on the next invoice unless the merchant sets charge_immediately=true. Upgrades apply instantly; downgrades apply at period end. A dunning cycle is 4 attempts over 14 days; after the final attempt the subscription moves to expired, not canceled, and the customer retains read-only access for 30 days.
+
+COMPLIANCE (CMP-001): Never provide guidance that could be read as financial advice. For regulatory questions (Reg E, PSD2 SCA, 3DS exemptions), quote the requirement and direct the caller to their compliance team; do not interpret applicability on their behalf. If a caller reads you cardholder data, instruct them to rotate the instrument and stop the transcript.
+
+TEST CARDS (QA-007): For sandbox verification use 4000000000000002 (declined), 4000000000009995 (insufficient funds), and 4242424242424242 (succeeds). Never run test cards in production keys; the antifraud system cannot distinguish them and the dispute rate recorded against the account is permanent. </textarea>
+
+        <button id="demo-route" class="route-btn" type="button">Route it</button>
+      </div>
+
+      <div class="term demo-out-wrap" aria-live="polite">
+        <div id="demo-out" class="demo-out"><p class="dim">routing&hellip;</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ============================= CONCEPTS ============================= -->
 <section id="concepts" class="section">
   <div class="container">
     <h2>What makes it different</h2>
-    <p class="section-sub">Six ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
+    <p class="section-sub">Ten ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
 
     <div class="grid">
       <article class="card">
@@ -210,6 +290,40 @@ conversation history       &rarr; 5m</pre>
         single canary probe, never by calling the provider for health's sake. Decision p50 under
         10&nbsp;ms, enforced in tests.</p>
       </article>
+
+      <article class="card">
+        <h3>Quality you can train, not just guess</h3>
+        <p>The bundled quality priors are placeholders. <code>llmrouter train</code> fits one logistic
+        head per model from your feedback JSONL (pointwise outcomes or pairwise preferences) and ships a
+        frozen 17-weight JSON checkpoint. The blend is
+        <code>quality = prior + &lambda;&middot;(b + w&middot;x)</code>, <code>&lambda; = n/(n+k)</code>:
+        no data, old behavior; the model talks only as loudly as its sample count earns. Training is
+        Python; inference is stdlib-only and identical in both runtimes.</p>
+      </article>
+
+      <article class="card">
+        <h3>Streaming that respects the first token</h3>
+        <p><code>router.astream()</code> yields deltas and finishes with the provider's real usage
+        counters, so affinity keeps learning on the stream path. Upstream failures fail over while
+        nothing has reached the caller; after the first token they raise rather than duplicate text
+        you already rendered.</p>
+      </article>
+
+      <article class="card">
+        <h3>State that outlives the process</h3>
+        <p>Session pins, hit-rate EWMAs, circuit health, fingerprints and pair economics fit one
+        atomic JSON snapshot (<code>llmrouter-state-v1</code>), with every timestamp rebased onto the
+        new process's monotonic clock at restore. The format is shared across runtimes, so a Python
+        replica and a Node replica can follow the same file.</p>
+      </article>
+
+      <article class="card">
+        <h3>A gateway surface, not a gateway rewrite</h3>
+        <p>Already running LiteLLM, Bifrost or your own proxy? <code>llmrouter serve</code> exposes
+        the decision over HTTP (<code>POST /decide</code>, identical wire format in both runtimes).
+        Decide with us, execute wherever, and feed the provider counters back on the next request so
+        the learned hit rate survives the boundary.</p>
+      </article>
     </div>
   </div>
 </section>
@@ -237,6 +351,18 @@ npx llmrouter explain --prompt "hi" --workload chat</code></pre>
         <p>Sweep the quality floor and report the value that hits your target strong-model share. The RouteLLM calibration pattern, generalized past two models.</p>
         <pre class="code"><code>llmrouter calibrate --data cases.jsonl --target-strong-pct 0.5</code></pre>
       </div>
+      <div class="cli-item">
+        <h3>train</h3>
+        <p>Fit logistic quality heads from feedback JSONL (pointwise or pairwise) and write a frozen checkpoint. Both engines load it and decide identically; thin models keep their prior via shrinkage.</p>
+        <pre class="code"><code>llmrouter train --data feedback.jsonl --out quality.json
+llmrouter eval --data cases.jsonl --ci --quality-model quality.json</code></pre>
+      </div>
+      <div class="cli-item">
+        <h3>serve</h3>
+        <p>Expose the decision as an HTTP sidecar for LiteLLM, Bifrost or your own proxy. Same wire format in both runtimes; session affinity keeps learning from the counters your gateway reports back.</p>
+        <pre class="code"><code>python -m llmrouter serve --port 8787   # POST /decide
+npx llmrouter serve --port 8787</code></pre>
+      </div>
     </div>
   </div>
 </section>
@@ -253,6 +379,9 @@ npx llmrouter explain --prompt "hi" --workload chat</code></pre>
           <tr><td>Install</td><td><code>pip install llmrouter[http]</code></td><td><code>npm install llmrouter</code></td></tr>
           <tr><td>Decision engine (scoring, TTL, stickiness, Rule F, budget)</td><td>yes</td><td>yes</td></tr>
           <tr><td>CLI (explain / eval / calibrate)</td><td><code>python -m llmrouter</code></td><td><code>npx llmrouter</code></td></tr>
+          <tr><td>Learned quality heads (train offline, infer in both runtimes)</td><td>train + infer</td><td>infer (same checkpoint)</td></tr>
+          <tr><td>Durable state (<code>llmrouter-state-v1</code> snapshots)</td><td>yes</td><td>yes (same format)</td></tr>
+          <tr><td>HTTP decide-sidecar (<code>POST /decide</code>)</td><td>yes</td><td>yes (same wire format)</td></tr>
           <tr><td>Async execution, retries, cross-model failover</td><td>yes</td><td>drive your own client from <code>decide()</code></td></tr>
           <tr><td>Provider adapters + usage-counter learning</td><td>yes (Anthropic, OpenAI-compatible)</td><td>roadmap</td></tr>
           <tr><td>Lead/sidekick delegation with pair economics</td><td>yes</td><td>roadmap</td></tr>
@@ -282,5 +411,6 @@ npx llmrouter explain --prompt "hi" --workload chat</code></pre>
 </footer>
 
 <script src="script.js" defer></script>
+<script type="module" src="demo.js"></script>
 </body>
 </html>

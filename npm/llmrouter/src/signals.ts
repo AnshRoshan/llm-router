@@ -38,7 +38,7 @@ export interface WorkloadClassifier {
   classify(request: RoutingRequest): WorkloadSignal | null;
 }
 
-const CODE_MARKERS = [
+export const CODE_MARKERS = [
   "```", "def ", "class ", "function ", "import ", "const ", "SELECT ",
 ] as const;
 
@@ -106,6 +106,21 @@ export class FingerprintRegistry {
     const set = this.seenByClient.get(key) ?? new Set<string>();
     set.add(fingerprint);
     this.seenByClient.set(key, set);
+  }
+
+  /** Snapshot accessors for state persistence (see store.ts). */
+  snapshotMap(): Array<[string, WorkloadSignal]> {
+    return [...this.map.entries()];
+  }
+
+  hydrate(fingerprint: string, signal: WorkloadSignal): void {
+    this.map.set(fingerprint, signal);
+  }
+
+  snapshotSeenByClient(): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of this.seenByClient) out[k] = [...v];
+    return out;
   }
 
   cardinalityByClient(): Record<string, number> {

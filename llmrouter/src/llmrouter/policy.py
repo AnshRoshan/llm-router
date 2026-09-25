@@ -15,6 +15,7 @@ global state, so a decision is reproducible from its inputs.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
@@ -22,6 +23,7 @@ from typing import Mapping, Sequence
 from . import economics
 from .affinity import SessionPolicy, affinity_prior, pick_backend, rendezvous_pick
 from .backends import BackendRegistry, BackendSpec
+from .learning import QualityModel, extract_features
 from .pricing import PriceCard, PriceRegistry
 from .signals import GAP_PRIOR, TURNS_PRIOR, WorkloadResolver
 
@@ -37,6 +39,16 @@ from .types import (
 )
 
 DEFAULT_EST_PREFIX_TOKENS = 4000
+
+
+def _tool_chars(tool: Mapping[str, Any]) -> int:
+    """Tool-schema length, serialized exactly as the fingerprint does.
+
+    Must match the JS engine's `JSON.stringify(tool)` byte-for-byte so both
+    runtimes estimate the same token counts and make the same decisions —
+    the cross-runtime parity suite asserts this.
+    """
+    return len(json.dumps(tool, separators=(",", ":")))
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,7 @@ class PolicyEngine:
         config: RouterConfig | None = None,
         pairs: Any = None,
         lead_model: str | None = None,
+        quality_model: QualityModel | None = None,
     ) -> None:
         self.prices = prices
         self.backends = backends
@@ -100,6 +113,18 @@ class PolicyEngine:
         #: is known, a measured pair profile scales the sidekick's cost.
         self.pairs = pairs
         self.lead_model = lead_model
+        #: Offline-trained quality heads (llmrouter.learning). When present, the
+        #: quality term is prior + shrunk learned delta instead of a guess.
+        self.quality_model = quality_model
+
+    # ------------------------------------------------------------------ #
+    # quality: prior, or prior + learned delta
+    # ------------------------------------------------------------------ #
+    def _quality(self, card: PriceCard, workload: WorkloadClass,
+                 features: tuple[float, ...] | None) -> float:
+        if self.quality_model is None or features is None:
+            return card.quality(workload.value)
+        return self.quality_model.quality(card, workload, features)
 
     def _pair_multiplier(self, card: PriceCard) -> float:
         """Measured pair rework, if we have a profile for (lead, this model)."""
@@ -124,7 +149,7 @@ class PolicyEngine:
             elif m.role != "user" or not req.is_first_turn:
                 chars += len(m.text)
         for t in req.tools:
-            chars += len(str(t))
+            chars += _tool_chars(t)
         for r in req.retrieved:
             chars += len(r)
         est = int(chars * self.config.est_tokens_per_char)
@@ -138,7 +163,7 @@ class PolicyEngine:
         check must count everything.
         """
         chars = sum(len(m.text) for m in req.messages)
-        chars += sum(len(str(t)) for t in req.tools)
+        chars += sum(_tool_chars(t) for t in req.tools)
         chars += sum(len(r) for r in req.retrieved)
         est = int(chars * self.config.est_tokens_per_char)
         # Never smaller than the prefix estimate: they measure overlapping
@@ -187,6 +212,17 @@ class PolicyEngine:
                 "no models available — check the price registry and agent profile"
             )
 
+        # Learned quality: one feature vector per decision, reused per card.
+        features = (extract_features(req, workload)
+                    if self.quality_model is not None else None)
+        if self.quality_model is not None:
+            covered, total = self.quality_model.coverage(sorted(allowed))
+            if covered:
+                reasons.append(
+                    f"learned-quality: {covered}/{total} models have trained "
+                    f"heads (shrinkage k={self.quality_model.shrinkage_k:g})"
+                )
+
         # ---- 2. session shape ------------------------------------------ #
         prefix_tokens = self.estimate_prefix_tokens(req)
         total_tokens = self.estimate_total_tokens(req)
@@ -234,7 +270,8 @@ class PolicyEngine:
         for card in self.prices.all():
             if card.model_id not in allowed:
                 continue
-            if not self._passes_hard_constraints(card, req, workload, total_tokens):
+            if not self._passes_hard_constraints(card, req, workload,
+                                                 total_tokens, features):
                 continue
 
             for backend in self.backends.available_for(card.model_id, now):
@@ -270,7 +307,7 @@ class PolicyEngine:
                         session, card, prefix_tokens, workload
                     )
 
-                quality = card.quality(workload.value)
+                quality = self._quality(card, workload, features)
 
                 cap = req.constraints.max_cost_usd
                 over_cap = cap is not None and cost > cap
@@ -464,16 +501,22 @@ class PolicyEngine:
     # ------------------------------------------------------------------ #
     def _allowed_models(self, req: RoutingRequest,
                         source: WorkloadSource) -> set[str]:
+        allowed: set[str] | None = None
         if req.agent_profile:
             profile = self.resolver.profiles.get(req.agent_profile)
             if profile is not None and profile.allowed_models:
-                return set(profile.allowed_models) & set(self.prices.ids())
-        return set(self.prices.ids())
+                allowed = set(profile.allowed_models) & set(self.prices.ids())
+        if req.constraints.allowed_models:
+            pool = set(req.constraints.allowed_models) & set(self.prices.ids())
+            allowed = pool if allowed is None else (allowed & pool)
+        return allowed if allowed is not None else set(self.prices.ids())
 
     def _passes_hard_constraints(self, card: PriceCard, req: RoutingRequest,
                                  workload: WorkloadClass,
-                                 prompt_tokens: int) -> bool:
-        quality = card.quality(workload.value)
+                                 prompt_tokens: int,
+                                 features: tuple[float, ...] | None = None,
+                                 ) -> bool:
+        quality = self._quality(card, workload, features)
         if quality < 0:
             # A negative prior means "explicitly unsupported for this workload".
             return False
@@ -524,7 +567,8 @@ class PolicyEngine:
             return int(len(s) * self.config.est_tokens_per_char)
 
         sys_t = toks(req.system_text())
-        tools_t = sum(toks(str(t)) for t in req.tools)
+        tools_t = sum(int(_tool_chars(t) * self.config.est_tokens_per_char)
+                      for t in req.tools)
         retr_t = sum(toks(r) for r in req.retrieved)
         hist_t = max(0, prefix_tokens - sys_t - tools_t - retr_t)
 

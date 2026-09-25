@@ -5,12 +5,19 @@
  * survives, and chooses prompt-cache TTL per breakpoint. Zero dependencies.
  */
 export * from "./types.js";
+export * from "./hash.js";
 export * from "./pricing.js";
 export * from "./economics.js";
 export * from "./affinity.js";
 export * from "./backends.js";
 export * from "./signals.js";
 export * from "./policy.js";
+export * from "./learning.js";
+export * from "./store.js";
+export {
+  buildEngine, createDecideServer, serveMain,
+  saveSnapshotFile, loadSnapshotFile,
+} from "./serve.js";
 export { runCli } from "./cli.js";
 
-export const VERSION = "0.1.0";
+export { VERSION } from "./version.js";

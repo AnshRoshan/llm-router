@@ -4,17 +4,15 @@
  * (HRW) hashing because it is stable under membership change — a hash-ring
  * rebalance is what silently converts a 90% hit rate into 12.5%.
  */
-import { createHash } from "node:crypto";
+import { nowMonotonic } from "./clock.js";
 import { WorkloadClass, WorkloadSource } from "./types.js";
+import { hash8Big } from "./hash.js";
 
 export const DEFAULT_IDLE_TTL_S = 3600.0;
 
 /** Deterministic, orderable rendezvous score for (key, node). */
 function hrw(key: string, node: string): bigint {
-  return createHash("sha256")
-    .update(key + "\x00" + node, "utf8")
-    .digest()
-    .readBigUInt64BE(0);
+  return hash8Big(key + "\x00" + node);
 }
 
 export function rendezvousPick(key: string, nodes: readonly string[]): string | null {
@@ -83,6 +81,18 @@ export class SessionPolicy {
     if (this.observedCacheHitRate === null || this.ewmaTotal < 0.5) return prior;
     return this.observedCacheHitRate;
   }
+
+  /** Read the EWMA accumulators (for state snapshots). */
+  get ewma(): [number, number] {
+    return [this.ewmaHits, this.ewmaTotal];
+  }
+
+  /** Hydrate the EWMA from a snapshot (see store.ts). */
+  hydrateEwma(hits: number, total: number, observed: number | null): void {
+    this.ewmaHits = hits;
+    this.ewmaTotal = total;
+    this.observedCacheHitRate = observed;
+  }
 }
 
 /** In-process session store with idle eviction. Swap for Redis >1 replica. */
@@ -125,6 +135,21 @@ export class SessionStore {
 
   evict(sessionKey: string): void {
     this.sessions.delete(sessionKey);
+  }
+
+  /** Read without side effects (no turn counting, no TTL sweep). */
+  peek(sessionKey: string): SessionPolicy | null {
+    return this.sessions.get(sessionKey) ?? null;
+  }
+
+  /** Read-only view for state snapshots (see store.ts). */
+  all(): IterableIterator<SessionPolicy> {
+    return this.sessions.values();
+  }
+
+  /** Insert a restored session verbatim, bypassing TTL/max-size rewriting. */
+  restore(session: SessionPolicy): void {
+    this.sessions.set(session.sessionKey, session);
   }
 
   clear(): void {
@@ -185,6 +210,3 @@ export function pickBackend(
   return rendezvousPick(key, healthy);
 }
 
-function nowMonotonic(): number {
-  return Number(process.hrtime.bigint()) / 1e9;
-}

@@ -10,6 +10,7 @@
  *
  * Port of the Python PolicyEngine; the two runtimes must agree on decisions.
  */
+import { nowMonotonic } from "./clock.js";
 import {
   affinityPrior,
   pickBackend,
@@ -21,6 +22,7 @@ import {
   chooseTtlBySegment,
   evaluateSwitch,
 } from "./economics.js";
+import { extractFeatures, QualityModel } from "./learning.js";
 import { PriceCard, PriceRegistry } from "./pricing.js";
 import {
   GAP_PRIOR,
@@ -82,6 +84,9 @@ export interface ScoredCandidate {
 
 export class PolicyEngine {
   readonly sessions: SessionStore;
+  /** Offline-trained quality heads (optional). When set, the quality term is
+   *  prior + shrunk learned delta, identical to the Python engine. */
+  qualityModel: QualityModel | null = null;
 
   constructor(
     public readonly prices: PriceRegistry,
@@ -89,8 +94,18 @@ export class PolicyEngine {
     public readonly resolver: WorkloadResolver = new WorkloadResolver(),
     public readonly config: RouterConfig = DEFAULT_CONFIG,
     sessions: SessionStore | null = null,
+    qualityModel: QualityModel | null = null,
   ) {
     this.sessions = sessions ?? new SessionStore();
+    this.qualityModel = qualityModel;
+  }
+
+  /** Blended quality for one card: prior, or prior + learned delta. */
+  quality(card: PriceCard, workload: WorkloadClass,
+          features: readonly number[] | null): number {
+    return this.qualityModel && features
+      ? this.qualityModel.quality(card, workload, features)
+      : card.quality(workload);
   }
 
   // ------------------------------------------------------------------ //
@@ -142,6 +157,18 @@ export class PolicyEngine {
 
     const allowed = this.allowedModels(req);
 
+    // Learned quality: one feature vector per decision, reused per card.
+    const features = this.qualityModel ? extractFeatures(req, workload) : null;
+    if (this.qualityModel && features) {
+      const [covered, total] = this.qualityModel.coverage([...allowed]);
+      if (covered > 0) {
+        reasons.push(
+          `learned-quality: ${covered}/${total} models have trained heads ` +
+            `(shrinkage k=${this.qualityModel.shrinkageK})`,
+        );
+      }
+    }
+
     // ---- 2. session shape ------------------------------------------------
     const prefixTokens = this.estimatePrefixTokens(req);
     const totalTokens = this.estimateTotalTokens(req);
@@ -181,7 +208,7 @@ export class PolicyEngine {
 
     for (const card of this.prices.all()) {
       if (!allowed.has(card.modelId)) continue;
-      if (!this.passesHardConstraints(card, req, workload, totalTokens)) continue;
+      if (!this.passesHardConstraints(card, req, workload, totalTokens, features)) continue;
 
       for (const backend of this.backends.availableFor(card.modelId, now)) {
         let hitRate = prior;
@@ -212,7 +239,7 @@ export class PolicyEngine {
           }
         }
 
-        const quality = card.quality(workload);
+        const quality = this.quality(card, workload, features);
         const overCap = cap !== null && cost > cap;
 
         // Closed-loop budget pacing on projected session spend.
@@ -395,23 +422,66 @@ export class PolicyEngine {
     );
   }
 
+  /**
+   * Execution-layer hook: create or re-pin the session after a call completes,
+   * mirroring the Python `Router._learn`. Without it, decision-only usage
+   * never builds session state and turn 2 never sees a warm cache. Pass the
+   * provider's usage counters when you have them — that is what turns the
+   * affinity bonus from a prior into a measurement.
+   */
+  recordDecision(
+    req: RoutingRequest,
+    d: Decision,
+    usage?: { cacheReadTokens: number; cacheWriteTokens: number },
+    now: number = nowMonotonic(),
+  ): SessionPolicy {
+    let session = this.sessions.get(d.stickyKey, now);
+    if (!session) {
+      session = new SessionPolicy(
+        d.stickyKey, d.workload, d.workloadSource, d.workloadConfidence,
+        d.modelId, d.backendId, now,
+      );
+      session.invalidatorsHash = req.invalidatorsFingerprint();
+    } else if (d.switched) {
+      // Re-pin after a migration so subsequent turns are sticky again.
+      session.pinnedModel = d.modelId;
+      session.pinnedBackend = d.backendId;
+    }
+    if (usage) {
+      session.recordUsage(usage.cacheReadTokens, usage.cacheWriteTokens);
+    }
+    this.sessions.put(session, now);
+    return session;
+  }
+
   // ------------------------------------------------------------------ //
   private allowedModels(req: RoutingRequest): Set<string> {
+    let allowed: Set<string> | null = null;
     if (req.agentProfile) {
       const profile = this.resolver.profiles.get(req.agentProfile);
       if (profile?.allowedModels && profile.allowedModels.length > 0) {
-        return new Set(
+        allowed = new Set(
           profile.allowedModels.filter((m) => this.prices.get(m) !== undefined),
         );
       }
     }
-    return new Set(this.prices.ids());
+    const pool = req.constraints.allowedModels;
+    if (pool && (pool instanceof Set ? pool.size > 0 : [...pool].length > 0)) {
+      const restricted = new Set(
+        [...pool].filter((m) => this.prices.get(m) !== undefined),
+      );
+      allowed = allowed === null ? restricted : new Set(
+        [...allowed].filter((m) => restricted.has(m)),
+      );
+    }
+    return allowed ?? new Set(this.prices.ids());
   }
 
   private passesHardConstraints(
-    card: PriceCard, req: RoutingRequest, workload: WorkloadClass, promptTokens: number,
+    card: PriceCard, req: RoutingRequest, workload: WorkloadClass,
+    promptTokens: number, features: readonly number[] | null = null,
   ): boolean {
-    const quality = card.quality(workload);
+    const quality = this.quality(card, workload, features);
     if (quality < 0) return false;
     if (this.config.weights.minQuality > 0 && quality < this.config.weights.minQuality) {
       return false;
@@ -452,6 +522,3 @@ export class PolicyEngine {
   }
 }
 
-function nowMonotonic(): number {
-  return Number(process.hrtime.bigint()) / 1e9;
-}

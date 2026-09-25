@@ -1,6 +1,6 @@
 {
   "name": "llmrouter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cache-aware LLM routing for Node.js: picks the (model, backend) pair, keeps sessions sticky, and chooses prompt-cache TTL per breakpoint. Zero dependencies.",
   "license": "Apache-2.0",
   "type": "module",
@@ -25,7 +25,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test \"test/**/*.test.mjs\""
+    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
+    "build:demo": "esbuild src/demo.ts --bundle --minify --format=iife --global-name=LLMRouterDemo --outfile=../../website/assets/llmrouter-demo.js"
   },
   "keywords": [
     "llm",
@@ -37,6 +38,7 @@
   ],
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.5.0"
   }
 }

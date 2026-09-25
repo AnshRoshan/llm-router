@@ -214,3 +214,50 @@ test("context-window pre-call check routes to a model that fits", () => {
   const d = engine.decide(new RoutingRequest([new Message("user", "x".repeat(20_000))], WorkloadClass.Chat));
   assert.equal(d.modelId, "large-window");
 });
+
+// --------------------------------------------------------------------------- //
+// sha256 — known-answer vectors (the hash must be right in EVERY runtime)
+// --------------------------------------------------------------------------- //
+import { sha256, hash16, hash8Big } from "../dist/hash.js";
+
+test("sha256 matches FIPS known-answer vectors", () => {
+  const hex = (s) => Buffer.from(sha256(new TextEncoder().encode(s))).toString("hex");
+  assert.equal(hex("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  assert.equal(hex(""),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  // > 55 bytes: exercises multi-block padding
+  assert.equal(hex("a".repeat(100)),
+    "2816597888e4a0d3a36b82b83316ab32680eb8f00f8cd3b904d681246d285a0e");
+});
+
+test("hash16 returns 32 hex chars, hash8Big a bigint", () => {
+  assert.equal(hash16("x").length, 32);
+  assert.equal(typeof hash8Big("x"), "bigint");
+});
+
+test("recordDecision builds session state for decision-only engines", () => {
+  const engine = makeEngine();
+  const mk = (text) => new RoutingRequest(
+    [new Message("system", "You are a support bot. ".repeat(120)), new Message("user", text)],
+    WorkloadClass.Chat, "s9",
+  );
+  const d1 = engine.decide(mk("turn one"));
+  engine.recordDecision(mk("turn one"), d1);
+  const d2 = engine.decide(mk("turn two"));
+  assert.equal(d2.reusedSession, true);
+  const warm = d2.candidates.find(
+    (c) => c.modelId === d2.modelId && c.backendId === d2.backendId,
+  );
+  assert.ok(warm.affinity > 0, "pinned pair should carry an affinity bonus");
+});
+
+test("Constraints.allowedModels restricts the candidate pool", () => {
+  const engine = makeEngine();
+  const d = engine.decide(new RoutingRequest(
+    [new Message("user", "hi")], WorkloadClass.Chat, null, null, [], [],
+    new Set(), { allowedModels: new Set(["claude-haiku-class", "claude-sonnet-class"]) },
+  ));
+  assert.ok(["claude-haiku-class", "claude-sonnet-class"].includes(d.modelId));
+  for (const c of d.candidates) assert.ok(c.modelId.startsWith("claude"));
+});

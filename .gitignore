@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+node_modules/
+
+# tooling scratch / local-only artifacts
+.tmp_parity/
+.video_agent/
+npm/website/
+website/_check.png
+website/_demo_crop.png

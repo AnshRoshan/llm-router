@@ -4,6 +4,7 @@
  * Local timeouts are aggressive on purpose: a saturated GPU that cascades to
  * cloud at 100x cost is the trap.
  */
+import { nowMonotonic } from "./clock.js";
 import { DeploymentClass } from "./types.js";
 
 export const DEFAULT_LOCAL_TIMEOUT_S = 8.0;
@@ -168,6 +169,11 @@ export class BackendRegistry {
     return h;
   }
 
+  /** Read-only view for state snapshots (see store.ts). */
+  allHealth(): IterableIterator<BackendHealth> {
+    return this.healthMap.values();
+  }
+
   candidatesFor(modelId: string): BackendSpec[] {
     return [...this.specs.values()].filter((b) => b.supports(modelId));
   }
@@ -193,6 +199,3 @@ export class BackendRegistry {
   }
 }
 
-function nowMonotonic(): number {
-  return Number(process.hrtime.bigint()) / 1e9;
-}

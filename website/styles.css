@@ -231,6 +231,82 @@ td:first-child { color: var(--fg); font-weight: 550; }
 .callout h3 { color: var(--warn); }
 .callout p { color: var(--fg-dim); margin: 0; max-width: 46rem; }
 
+/* ---------------- live demo ---------------- */
+.demo-grid { display: grid; grid-template-columns: 340px 1fr; gap: 1.5rem; align-items: start; }
+@media (max-width: 900px) { .demo-grid { grid-template-columns: 1fr; } }
+.demo-controls { display: grid; gap: 0.35rem; }
+.demo-controls label {
+  font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--fg-dim); margin-top: 0.8rem;
+}
+.demo-controls label:first-child { margin-top: 0; }
+.demo-controls .dim { text-transform: none; letter-spacing: 0; color: var(--fg-faint); }
+.demo-controls textarea, .demo-controls input, .demo-controls select {
+  width: 100%; font-family: var(--font-mono); font-size: 0.84rem;
+  color: var(--fg); background: var(--bg-term); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.55rem 0.7rem; resize: vertical;
+}
+.demo-controls textarea:focus, .demo-controls input:focus, .demo-controls select:focus {
+  outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent);
+}
+.route-btn {
+  margin-top: 1.1rem; padding: 0.65rem 1.2rem;
+  font-family: var(--font-mono); font-size: 0.9rem; font-weight: 600;
+  color: #fff; background: var(--accent); border: none; border-radius: 6px;
+  cursor: pointer;
+  transition: background-color var(--duration-hover) ease-out, transform var(--duration-hover) ease-out;
+}
+.route-btn:hover { background: #2f6fe0; }
+.route-btn:active { transform: scale(0.98); }
+
+.demo-out { font-family: var(--font-mono); font-size: 0.84rem; line-height: 1.65; }
+.demo-chosen { font-size: 1.15rem; font-weight: 650; color: var(--accent-text); }
+.demo-chosen .dim { font-size: 0.9rem; }
+.demo-meta {
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; margin: 0.6rem 0 1rem;
+  font-size: 0.8rem; color: var(--fg-dim);
+}
+.demo-meta strong { color: var(--fg); font-weight: 600; }
+.demo-table { margin-bottom: 1rem; font-size: 0.8rem; }
+.demo-table td, .demo-table th { padding: 0.5rem 0.7rem; white-space: nowrap; }
+.demo-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.demo-table .dim { color: var(--fg-faint); }
+.demo-table tr.picked td { background: var(--accent-soft); color: var(--accent-text); }
+.demo-table tr.picked td:first-child { border-left: 2px solid var(--accent); }
+.demo-reasons { margin: 0; padding-left: 1.2rem; color: var(--fg-dim); font-size: 0.8rem; }
+.demo-reasons li { margin-bottom: 0.25rem; }
+.demo-hint { font-family: var(--font-body); font-size: 0.78rem; color: var(--fg-faint); margin: 0.9rem 0 0; }
+.dim { color: var(--fg-faint); }
+
+/* score bars inside the candidate table */
+.bar {
+  display: block; width: 100%; height: 3px; margin-top: 0.3rem;
+  background: var(--border); border-radius: 2px; overflow: hidden;
+}
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+tr.picked .bar > span { background: var(--accent-text); }
+.demo-table .warm { color: var(--good); }
+
+/* TTL chips */
+.ttl-line { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.ttl-chip {
+  font-size: 0.72rem; letter-spacing: 0.03em;
+  font-family: var(--font-mono);
+  color: var(--fg-dim); background: var(--bg-term);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0.12rem 0.5rem;
+}
+.ttl-chip.ttl-1h {
+  color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: var(--accent-soft);
+}
+
+/* ---------------- scroll progress ---------------- */
+#scroll-progress {
+  position: fixed; top: 0; left: 0; height: 2px; width: 0;
+  background: var(--accent); z-index: 100; pointer-events: none;
+}
+.nav nav a.active { color: var(--accent-text); }
+
 /* footer */
 .footer { border-top: 1px solid var(--border); padding: 2rem 0 2.4rem; }
 .footer-inner { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; align-items: baseline; }

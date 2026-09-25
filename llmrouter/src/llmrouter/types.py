@@ -101,6 +101,10 @@ class Constraints:
     budget_remaining_usd: float | None = None
     residency_tags: frozenset[str] = frozenset()
     require_tools: bool = False
+    #: Hard restriction on the candidate pool (the complement of
+    #: `AgentProfile.allowed_models`, for caller-supplied restrictions that
+    #: arrive with the request rather than with a named agent).
+    allowed_models: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,65 @@ class RoutingRequest:
             return f"ctx:{h}"
         return f"fp:{self.prompt_fingerprint()}:{self.client_id or 'anon'}"
 
+    # ---- wire format (HTTP sidecar; snake_case on both runtimes) --------- #
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "messages": [{"role": m.role, "content": m.content}
+                         for m in self.messages],
+            "workload": self.workload.value if self.workload else None,
+            "session_id": self.session_id,
+            "agent_profile": self.agent_profile,
+            "tools": [dict(t) for t in self.tools],
+            "retrieved": list(self.retrieved),
+            "tags": sorted(self.tags),
+            "constraints": {
+                "max_cost_usd": self.constraints.max_cost_usd,
+                "max_latency_ms": self.constraints.max_latency_ms,
+                "budget_remaining_usd": self.constraints.budget_remaining_usd,
+                "residency_tags": sorted(self.constraints.residency_tags),
+                "require_tools": self.constraints.require_tools,
+                "allowed_models": sorted(self.constraints.allowed_models),
+            },
+            "expected_turns": self.expected_turns,
+            "expected_gap_s": self.expected_gap_s,
+            "expected_generation_s": self.expected_generation_s,
+            "client_id": self.client_id,
+        }
+
+    @classmethod
+    def from_payload(cls, obj: Mapping[str, Any]) -> "RoutingRequest":
+        raw_messages = obj.get("messages") or []
+        if not isinstance(raw_messages, Sequence) or not raw_messages:
+            raise ValueError("payload needs a non-empty 'messages' array")
+        messages = tuple(
+            Message(str(m.get("role", "user")), m.get("content", ""))
+            for m in raw_messages
+        )
+        workload = obj.get("workload")
+        c = obj.get("constraints") or {}
+        constraints = Constraints(
+            max_cost_usd=c.get("max_cost_usd"),
+            max_latency_ms=c.get("max_latency_ms"),
+            budget_remaining_usd=c.get("budget_remaining_usd"),
+            residency_tags=frozenset(str(t) for t in (c.get("residency_tags") or ())),
+            require_tools=bool(c.get("require_tools")),
+            allowed_models=frozenset(str(m) for m in (c.get("allowed_models") or ())),
+        )
+        return cls(
+            messages=messages,
+            workload=WorkloadClass(str(workload)) if workload else None,
+            session_id=obj.get("session_id"),
+            agent_profile=obj.get("agent_profile"),
+            tools=tuple(obj.get("tools") or ()),
+            retrieved=tuple(str(r) for r in (obj.get("retrieved") or ())),
+            tags=frozenset(str(t) for t in (obj.get("tags") or ())),
+            constraints=constraints,
+            expected_turns=obj.get("expected_turns"),
+            expected_gap_s=obj.get("expected_gap_s"),
+            expected_generation_s=obj.get("expected_generation_s"),
+            client_id=obj.get("client_id"),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Decisions
@@ -268,6 +331,40 @@ class Decision:
         for r in self.reasons:
             lines.append(f"  · {r}")
         return "\n".join(lines)
+
+    def to_payload(self) -> dict[str, Any]:
+        """JSON-safe form for the HTTP decide endpoint (snake_case, mirrored
+        by the TypeScript Decision.toPayload)."""
+        return {
+            "model_id": self.model_id,
+            "backend_id": self.backend_id,
+            "workload": self.workload.value,
+            "workload_source": self.workload_source.value,
+            "workload_confidence": self.workload_confidence,
+            "sticky_key": self.sticky_key,
+            "session_key": self.session_key,
+            "is_first_turn": self.is_first_turn,
+            "reused_session": self.reused_session,
+            "switched": self.switched,
+            "stranded": self.stranded,
+            "ttl_by_segment": {k.value: v for k, v in self.ttl_by_segment.items()},
+            "candidates": [
+                {
+                    "model_id": c.model_id, "backend_id": c.backend_id,
+                    "score": c.score, "quality": c.quality,
+                    "cost_usd": c.cost_usd, "latency_ms": c.latency_ms,
+                    "affinity": c.affinity, "switch_cost_usd": c.switch_cost_usd,
+                    "reasons": list(c.reasons),
+                }
+                for c in self.candidates
+            ],
+            "reasons": list(self.reasons),
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cost_usd": self.cost_usd,
+            "latency_ms": self.latency_ms,
+            "error": self.error,
+        }
 
 
 __all__ = [
