@@ -19,7 +19,8 @@ mkdirSync(dest, { recursive: true });
 
 const included = new Set([
   "types.js", "pricing.js", "economics.js", "affinity.js",
-  "backends.js", "signals.js", "policy.js", "learning.js", "hash.js",
+  "backends.js", "signals.js", "policy.js", "learning.js",
+  "hash.js", "clock.js",
 ]);
 
 let copied = 0;
