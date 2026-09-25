@@ -81,8 +81,34 @@ await router.acomplete(msgs, agent_profile="triage")
    second request through a given prompt is an exact, free hit.
 3. **classifier hook** — only when 1 and 2 abstain, and **only on turn 1**. The
    cost is paid once and amortized over the session; per-*step* classification is
-   deliberately not supported.
+   deliberately not supported. A ready implementation ships for
+   [Laya](https://github.com/NandhaKishorM/laya) — see below.
 4. **default** — never fails to route; logged as `default` so it stays auditable.
+
+### B3, implemented: `LayaWorkloadClassifier`
+
+[Laya](https://github.com/NandhaKishorM/laya) is a local typed-decision
+classifier: ~33 ms per question in a single non-autoregressive forward pass —
+no text generation, so nothing to parse and nothing to hallucinate, and its
+calibration is trained against proper scoring rules (exactly what a
+confidence you route with should mean). This router ships the adapter:
+
+```python
+from llmrouter import LayaWorkloadClassifier, Router
+
+router = Router.with_ollama(          # or with_defaults / pure(...)
+    classifier=LayaWorkloadClassifier("http://127.0.0.1:8000/predict"),
+    ...
+)
+```
+
+Design rules the adapter honors: one `choice` question over the six workload
+classes via Laya's documented FastAPI `POST /predict` contract; stdlib
+`urllib` only (Laya's torch stack stays in *its* process, so the
+zero-dependency rule holds here); a 2 s timeout and confidence floor — and
+**any** failure returns `None`, which just means B3 abstains and the
+fingerprint/default paths carry on. A classifier is an upgrade, never a
+dependency.
 
 ## What makes it different
 

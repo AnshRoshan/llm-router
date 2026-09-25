@@ -237,7 +237,7 @@ TEST CARDS (QA-007): For sandbox verification use 4000000000000002 (declined), 4
 <section id="concepts" class="section">
   <div class="container">
     <h2>What makes it different</h2>
-    <p class="section-sub">Eleven ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
+    <p class="section-sub">Twelve ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
 
     <div class="grid">
       <article class="card">
@@ -332,6 +332,16 @@ conversation history       &rarr; 5m</pre>
         A $0.35/hr box at 35 tok/s costs $2.78/MTok &mdash; it beats or loses to gpt-mini on arithmetic,
         not vibes. An 8-second timeout plus <code>capacity_rps</code> shedding exist to beat the cascade
         trap, and traffic fails over to the API when the GPU saturates, then drains back.</p>
+      </article>
+
+      <article class="card">
+        <h3>Turn-1 inference you can afford</h3>
+        <p>When structural rules and the prompt fingerprint both abstain, the classifier hook (path B3)
+        may ask a small model &mdash; once, on turn 1, amortized over the session.
+        <code>LayaWorkloadClassifier</code> plugs in <a href="https://github.com/NandhaKishorM/laya">Laya</a>,
+        a local typed-decision classifier: ~33 ms, no text generation, nothing to hallucinate, calibration
+        trained against proper scoring rules. Stdlib HTTP only, and any failure is a clean abstention
+        &mdash; an upgrade, never a dependency.</p>
       </article>
     </div>
   </div>
