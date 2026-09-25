@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmrouter: cache-aware LLM routing</title>
+<meta name="description" content="llmrouter picks the (model, backend) pair, keeps sessions sticky so the prompt cache survives, and chooses prompt-cache TTL per breakpoint. Python and Node.js, zero dependencies.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230B0F14'/%3E%3Cpath d='M6 16h8m0 0 4-6h8m-12 6 4 6h8' stroke='%233B82F6' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+<!-- The real decision engine (npm package, bundled). Must run before script.js. -->
+<script src="assets/llmrouter-demo.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="container nav-inner">
+    <a class="brand" href="#top" aria-label="llmrouter home">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="6" fill="#0E1520"/><path d="M6 16h8m0 0 4-6h8m-12 6 4 6h8" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      llmrouter
+    </a>
+    <nav aria-label="Main">
+      <a href="#why">Why</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="#demo">Live demo</a>
+      <a href="#concepts">Concepts</a>
+      <a href="#cli">CLI</a>
+      <a href="#packages">Packages</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ============================= HERO ============================= -->
+<section class="hero" id="top">
+  <div class="container">
+    <p class="eyebrow">Python &middot; Node.js &middot; zero dependencies</p>
+    <h1 class="hero-title">The cache decides the cost.<br>So the router routes for the cache.</h1>
+    <p class="hero-sub">
+      Most routers ask <em>which model is smartest</em>. llmrouter asks three questions:
+      which <strong>model</strong>, which <strong>backend</strong>, and which <strong>cache TTL</strong>.
+      Prompt caches are model-scoped and non-transferable, so a router that switches models
+      mid-conversation can cost more than not routing at all. This one keeps the cache warm.
+    </p>
+
+    <div class="install" role="group" aria-label="Install commands">
+      <div class="tabs" role="tablist" aria-label="Package manager">
+        <button class="tab" role="tab" id="tab-pip" aria-controls="panel-pip" aria-selected="true">pip</button>
+        <button class="tab" role="tab" id="tab-npm" aria-controls="panel-npm" aria-selected="false">npm</button>
+      </div>
+      <div class="term" role="tabpanel" id="panel-pip" aria-labelledby="tab-pip">
+        <button class="copy" data-copy="pip install llmrouter" aria-label="Copy pip install command">copy</button>
+        <pre><span class="cmt"># decision engine, zero dependencies</span>
+pip install llmrouter
+<span class="cmt"># + httpx, to actually call providers</span>
+pip install "llmrouter[http]"</pre>
+      </div>
+      <div class="term" role="tabpanel" id="panel-npm" aria-labelledby="tab-npm" hidden>
+        <button class="copy" data-copy="npm install llmrouter" aria-label="Copy npm install command">copy</button>
+        <pre><span class="cmt"># decision engine for Node.js, zero dependencies</span>
+npm install llmrouter</pre>
+      </div>
+    </div>
+
+    <div class="proof" aria-label="Verified economics, from the paired test suites">
+      <div class="proof-item"><span class="proof-num">R&#42;&nbsp;=&nbsp;4.75</span><span class="proof-label">turns for a sonnet&rarr;haiku migration to pay back</span></div>
+      <div class="proof-item"><span class="proof-num">E&#42;&nbsp;=&nbsp;0.652</span><span class="proof-label">one cache expiry justifies the 1-hour TTL</span></div>
+      <div class="proof-item"><span class="proof-num">$0.75&nbsp;&gt;&nbsp;$0.62</span><span class="proof-label">oscillating A&rarr;B&rarr;A&rarr;B costs more than never routing</span></div>
+      <div class="proof-item"><span class="proof-num">~30&ndash;40%</span><span class="proof-label">the honest savings number, at &le;2% quality loss</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= WHY ============================= -->
+<section id="why" class="section">
+  <div class="container">
+    <h2>Three questions, not one</h2>
+    <p class="section-sub">The cost of a request is not decided by the model alone. Workload class and deployment class compose instead of being decided sequentially, and scoring is per <strong>(model, backend)&nbsp;pair</strong>.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">Question</th><th scope="col">What it depends on</th><th scope="col">How llmrouter answers</th></tr></thead>
+        <tbody>
+          <tr><td>Which <strong>model</strong>?</td><td>workload class, quality bar, budget</td><td>scoring with a measured quality floor, hard constraints, budget pacing</td></tr>
+          <tr><td>Which <strong>backend</strong>?</td><td>self-hosted vs API vs serverless, live health, residency</td><td>per-pair scoring, circuit breaker with canary recovery, rendezvous affinity</td></tr>
+          <tr><td>Which <strong>cache TTL</strong>?</td><td>expected idle gap, generation time, prompt segment</td><td>mixed TTL per breakpoint: system and tools at 1h, history at 5m</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= QUICKSTART ============================= -->
+<section id="quickstart" class="section section-alt">
+  <div class="container">
+    <h2>Quick start</h2>
+    <p class="section-sub">Both packages ship the same decision engine. The Python package adds the async execution layer: retries, failover, adapters, and the learning loop.</p>
+
+    <div class="qs-grid">
+      <div class="qs-col">
+        <div class="qs-head">
+          <span class="pkg-pill">Python</span>
+          <span class="pkg-note">pip install llmrouter[http]</span>
+        </div>
+<pre class="code"><code>import asyncio
+from llmrouter import Message, Router
+
+router = Router.with_defaults(
+    anthropic_key="sk-...", openai_key="sk-...",
+    sidekick_model="gpt-mini-class",
+)
+
+async def main():
+    out = await router.acomplete(
+        [Message("system", "You are a support bot."),
+         Message("user", "hi")],
+        session_id="user-42",   # keeps the prompt cache warm
+        workload="chat",
+    )
+    print(out.text)
+    print(router.explain())     # every decision is auditable
+
+asyncio.run(main())</code></pre>
+      </div>
+
+      <div class="qs-col">
+        <div class="qs-head">
+          <span class="pkg-pill pkg-node">Node.js</span>
+          <span class="pkg-note">npm install llmrouter</span>
+        </div>
+<pre class="code"><code>import {
+  Message, RoutingRequest, WorkloadClass,
+  PolicyEngine, PriceRegistry, BackendRegistry,
+} from "llmrouter";
+
+const engine = new PolicyEngine(
+  new PriceRegistry(), new BackendRegistry(),
+);
+
+const decision = engine.decide(new RoutingRequest(
+  [new Message("user", "refactor this function")],
+  WorkloadClass.Code,
+  "user-42",                 // session id: sticky caching
+));
+
+decision.modelId;            // "gpt-frontier-class"
+decision.backendId;          // "openai"
+decision.ttlBySegment;       // system=&gt;1h, history=&gt;5m
+console.log(decision.explain());</code></pre>
+      </div>
+    </div>
+
+    <p class="section-note">No keys, no network in the decision layer. Drive your own HTTP client from
+    <code>decide()</code>, or use the Python <code>acomplete()</code> path for retries, cross-model failover
+    and usage-counter learning.</p>
+  </div>
+</section>
+
+<!-- ============================= LIVE DEMO ============================= -->
+<section id="demo" class="section">
+  <div class="container">
+    <h2>Route something, right here</h2>
+    <p class="section-sub">This is not a mockup: the form below runs the actual
+    <code>llmrouter</code> decision engine (the same TypeScript modules published to npm)
+    in your browser, against the bundled price cards. No network, no keys. Keep the session id
+    and route twice to watch the cache warm up. Raise the idle gap past five minutes and,
+    when the winner is an Anthropic-backed model, the system segment steps up to the 1-hour tier;
+    OpenAI-backed picks have no explicit TTL tiers at all, and the chips show exactly that.</p>
+
+    <div class="demo-grid">
+      <div class="demo-controls">
+        <label for="demo-prompt">User message</label>
+        <textarea id="demo-prompt" rows="3" spellcheck="false">I was charged twice for my subscription this month, how do I get a refund?</textarea>
+
+        <label for="demo-workload">Workload class</label>
+        <select id="demo-workload">
+          <option value="auto" selected>auto (infer it)</option>
+          <option value="Chat">chat</option>
+          <option value="Code">code</option>
+          <option value="Rag">rag</option>
+          <option value="Agent">agent</option>
+          <option value="Batch">batch</option>
+          <option value="Vision">vision</option>
+        </select>
+
+        <label for="demo-session">Session id <span class="dim">(stickiness)</span></label>
+        <input id="demo-session" type="text" value="demo-session" spellcheck="false">
+
+        <label for="demo-pool">Candidate pool <span class="dim">(Anthropic-backed models carry the explicit 1h TTL tier)</span></label>
+        <select id="demo-pool">
+          <option value="all" selected>all models</option>
+          <option value="anthropic">Anthropic-backed only</option>
+          <option value="openai">OpenAI-backed only</option>
+        </select>
+
+        <label for="demo-gap">Expected idle gap between turns, seconds <span class="dim">(TTL policy)</span></label>
+        <input id="demo-gap" type="number" min="0" step="30" value="90">
+
+        <label for="demo-system">System prompt <span class="dim">(the cacheable prefix; long enough to clear the provider's 1,024-token cache minimum)</span></label>
+        <textarea id="demo-system" rows="6" spellcheck="false">You are a senior support engineer for a payments platform. Answer with the relevant policy, the exact next steps, and the API calls required. Cite the policy id for every claim.
+
+REFUND POLICY (POL-101): Duplicate charges are refunded in full within 30 days of the second capture. Partial refunds follow the merchant agreement section 4.2. Refunds over $500 require a dispute-engineering review before submission. Process refunds against the original payment intent, never a new one, or reconciliation will double-count the payout.
+
+DISPUTE POLICY (POL-114): Chargebacks must be answered within 7 days. Gather: capture timestamp, AVS result, CVV match, device fingerprint, and prior refund history. Write the evidence narrative in neutral, factual language; never speculate about customer intent in writing.
+
+API CONVENTIONS (API-009): All list endpoints paginate with cursor= and limit= (max 100). Idempotency keys are required on every POST that moves money; reuse the same key for exactly one logical operation. Errors arrive as { error: { type, code, message, request_id } }; always surface request_id to the caller for tracing.
+
+RATE LIMITS (OPS-020): Default 100 requests/second per key, burst 200. On 429, retry with exponential backoff and honor Retry-After. Sustained saturation for 5 minutes trips an automatic key review.
+
+DATA HANDLING (SEC-041): Never echo full card numbers, bank account numbers, or government identifiers back to the caller; mask to the last four. PII stays inside this conversation and is never quoted into external tickets. Logs reference customers by customer_id only.
+
+ESCALATION (POL-121): Escalate to a human reviewer when: the disputed amount exceeds $500, the customer mentions legal action or regulators, the account has three or more disputes in 90 days, or you are uncertain which policy applies. State the escalation reason explicitly and hand over a summary the reviewer can act on without re-reading the thread.
+
+TONE (POL-002): Be concise: no more than 150 words unless the caller asks for a full walkthrough. Lead with the answer, then the steps, then the citation. No apologies chains; one acknowledgment maximum.
+
+CHARGEBACK EVIDENCE CHECKLIST (POL-115): Assemble in this order and nothing else: (1) proof of authorization: AVS result, CVV match status, 3DS liability shift indicator; (2) proof of delivery: carrier tracking with delivered status and address match, or access logs for digital goods; (3) proof of usage: login timestamps after the disputed charge, API calls made with the purchased quota; (4) prior communication: refund offers made, acknowledgments of receipt by the customer. Attach raw logs as plain text, never screenshots; the network needs machine-readable evidence.
+
+SETTLEMENT AND PAYOUTS (FIN-033): Payouts run on a 2-business-day rolling schedule. Weekends and bank holidays delay, never accelerate, a payout. A refund issued against a capture in a prior payout cycle nets against the current cycle balance; explain this to merchants who ask why a payout is smaller than expected. Negative balances offset against future sales for 90 days before we invoice.
+
+SUBSCRIPTIONS (SUB-050): Proration is calculated to the second, billed on the next invoice unless the merchant sets charge_immediately=true. Upgrades apply instantly; downgrades apply at period end. A dunning cycle is 4 attempts over 14 days; after the final attempt the subscription moves to expired, not canceled, and the customer retains read-only access for 30 days.
+
+COMPLIANCE (CMP-001): Never provide guidance that could be read as financial advice. For regulatory questions (Reg E, PSD2 SCA, 3DS exemptions), quote the requirement and direct the caller to their compliance team; do not interpret applicability on their behalf. If a caller reads you cardholder data, instruct them to rotate the instrument and stop the transcript.
+
+TEST CARDS (QA-007): For sandbox verification use 4000000000000002 (declined), 4000000000009995 (insufficient funds), and 4242424242424242 (succeeds). Never run test cards in production keys; the antifraud system cannot distinguish them and the dispute rate recorded against the account is permanent. </textarea>
+
+        <button id="demo-route" class="route-btn" type="button">Route it</button>
+      </div>
+
+      <div class="term demo-out-wrap" aria-live="polite">
+        <div id="demo-out" class="demo-out"><p class="dim">routing&hellip;</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= CONCEPTS ============================= -->
+<section id="concepts" class="section">
+  <div class="container">
+    <h2>What makes it different</h2>
+    <p class="section-sub">Ten ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
+
+    <div class="grid">
+      <article class="card">
+        <h3>Pairs, not models</h3>
+        <p>The score is per (model, backend) pair, with the two terms most routers leave out:</p>
+        <pre class="formula">score = w_q&middot;quality &minus; w_c&middot;cost &minus; w_l&middot;latency
+      &minus; w_s&middot;switch_cost   <span class="cmt">// cache you throw away</span>
+      + w_a&middot;affinity      <span class="cmt">// measured hit rate</span></pre>
+        <p>The affinity bonus is <em>learned</em> from the usage counters every provider returns, not assumed.</p>
+      </article>
+
+      <article class="card">
+        <h3>TTL per breakpoint</h3>
+        <p>System prompt, tool schemas and retrieved chunks are stable, so they get the 1-hour tier.
+        Conversation history is append-only, so paying 2&times; to cache it is waste: 5 minutes.</p>
+        <pre class="formula">tools + system + retrieved &rarr; 1h
+conversation history       &rarr; 5m</pre>
+        <p>The decision uses <code>expected_gap + generation_time</code>, because the cache lifetime
+        is measured from the start of the request.</p>
+      </article>
+
+      <article class="card">
+        <h3>Stickiness with an amortization test</h3>
+        <p>A one-way migration must pay back inside the turns left:</p>
+        <pre class="formula">R&#42; = (c'&middot;w' &minus; c&middot;r) / ((c &minus; c')&middot;r)</pre>
+        <p>On Anthropic that is 4.75 turns for sonnet&rarr;haiku; onto a no-write-premium provider it is
+        under one turn. If the migration cannot pay back, the router stays put and increments a
+        <strong>stranded</strong> counter you can see. A session that already migrated once never migrates again.</p>
+      </article>
+
+      <article class="card">
+        <h3>Delegate instead of switching</h3>
+        <p>Mid-session model switching destroys the cache. Delegation does not: a frontier lead and a
+        cheaper sidekick run with two separate contexts and two separate warm caches, exchanging only
+        a <em>brief</em>. Routing is by task <strong>phase</strong>, which is observable from the
+        tool-call history, not by difficulty, which is not. Planning is lead-only.</p>
+      </article>
+
+      <article class="card">
+        <h3>Rule F: invalidating drift</h3>
+        <p>A provider's cache key covers more than the prefix: tool schemas, image usage, thinking
+        settings. If those drift inside a pinned session, every candidate is scored cold for that
+        turn and the decision says so. Raising <code>thinking.effort</code> is priced like a model switch.</p>
+      </article>
+
+      <article class="card">
+        <h3>Hard constraints and honest failure</h3>
+        <p>Pre-call context-window validation. Residency tags fail closed: no compliant model, no call.
+        Budget caps pick the cheapest violator and say so. The circuit breaker recovers through a
+        single canary probe, never by calling the provider for health's sake. Decision p50 under
+        10&nbsp;ms, enforced in tests.</p>
+      </article>
+
+      <article class="card">
+        <h3>Quality you can train, not just guess</h3>
+        <p>The bundled quality priors are placeholders. <code>llmrouter train</code> fits one logistic
+        head per model from your feedback JSONL (pointwise outcomes or pairwise preferences) and ships a
+        frozen 17-weight JSON checkpoint. The blend is
+        <code>quality = prior + &lambda;&middot;(b + w&middot;x)</code>, <code>&lambda; = n/(n+k)</code>:
+        no data, old behavior; the model talks only as loudly as its sample count earns. Training is
+        Python; inference is stdlib-only and identical in both runtimes.</p>
+      </article>
+
+      <article class="card">
+        <h3>Streaming that respects the first token</h3>
+        <p><code>router.astream()</code> yields deltas and finishes with the provider's real usage
+        counters, so affinity keeps learning on the stream path. Upstream failures fail over while
+        nothing has reached the caller; after the first token they raise rather than duplicate text
+        you already rendered.</p>
+      </article>
+
+      <article class="card">
+        <h3>State that outlives the process</h3>
+        <p>Session pins, hit-rate EWMAs, circuit health, fingerprints and pair economics fit one
+        atomic JSON snapshot (<code>llmrouter-state-v1</code>), with every timestamp rebased onto the
+        new process's monotonic clock at restore. The format is shared across runtimes, so a Python
+        replica and a Node replica can follow the same file.</p>
+      </article>
+
+      <article class="card">
+        <h3>A gateway surface, not a gateway rewrite</h3>
+        <p>Already running LiteLLM, Bifrost or your own proxy? <code>llmrouter serve</code> exposes
+        the decision over HTTP (<code>POST /decide</code>, identical wire format in both runtimes).
+        Decide with us, execute wherever, and feed the provider counters back on the next request so
+        the learned hit rate survives the boundary.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= CLI ============================= -->
+<section id="cli" class="section section-alt">
+  <div class="container">
+    <h2>The learning layer, on the command line</h2>
+    <p class="section-sub">Pure decision layer, no keys, no network. Identical commands in both runtimes.</p>
+
+    <div class="cli-grid">
+      <div class="cli-item">
+        <h3>explain</h3>
+        <p>Route one prompt and print the full auditable decision: candidates, scores, TTL choices, and why the workload class was picked.</p>
+        <pre class="code"><code>python -m llmrouter explain --prompt "hi" --workload chat
+npx llmrouter explain --prompt "hi" --workload chat</code></pre>
+      </div>
+      <div class="cli-item">
+        <h3>eval</h3>
+        <p>Run a JSONL case file and gate it: exit code 1 when quality drops below the floor, cases become unroutable, expected models disagree, or decision p50 passes 10 ms. The pre-merge gate for routing changes.</p>
+        <pre class="code"><code>llmrouter eval --data cases.jsonl --ci --quality-floor 0.75 --json</code></pre>
+      </div>
+      <div class="cli-item">
+        <h3>calibrate</h3>
+        <p>Sweep the quality floor and report the value that hits your target strong-model share. The RouteLLM calibration pattern, generalized past two models.</p>
+        <pre class="code"><code>llmrouter calibrate --data cases.jsonl --target-strong-pct 0.5</code></pre>
+      </div>
+      <div class="cli-item">
+        <h3>train</h3>
+        <p>Fit logistic quality heads from feedback JSONL (pointwise or pairwise) and write a frozen checkpoint. Both engines load it and decide identically; thin models keep their prior via shrinkage.</p>
+        <pre class="code"><code>llmrouter train --data feedback.jsonl --out quality.json
+llmrouter eval --data cases.jsonl --ci --quality-model quality.json</code></pre>
+      </div>
+      <div class="cli-item">
+        <h3>serve</h3>
+        <p>Expose the decision as an HTTP sidecar for LiteLLM, Bifrost or your own proxy. Same wire format in both runtimes; session affinity keeps learning from the counters your gateway reports back.</p>
+        <pre class="code"><code>python -m llmrouter serve --port 8787   # POST /decide
+npx llmrouter serve --port 8787</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= PACKAGES ============================= -->
+<section id="packages" class="section">
+  <div class="container">
+    <h2>Two packages, one decision engine</h2>
+    <p class="section-sub">Same price cards, same formulas, same scoring. The paired test suites assert identical numbers, so both runtimes agree on every decision.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col"></th><th scope="col">Python &middot; pip</th><th scope="col">Node.js &middot; npm</th></tr></thead>
+        <tbody>
+          <tr><td>Install</td><td><code>pip install llmrouter[http]</code></td><td><code>npm install llmrouter</code></td></tr>
+          <tr><td>Decision engine (scoring, TTL, stickiness, Rule F, budget)</td><td>yes</td><td>yes</td></tr>
+          <tr><td>CLI (explain / eval / calibrate)</td><td><code>python -m llmrouter</code></td><td><code>npx llmrouter</code></td></tr>
+          <tr><td>Learned quality heads (train offline, infer in both runtimes)</td><td>train + infer</td><td>infer (same checkpoint)</td></tr>
+          <tr><td>Durable state (<code>llmrouter-state-v1</code> snapshots)</td><td>yes</td><td>yes (same format)</td></tr>
+          <tr><td>HTTP decide-sidecar (<code>POST /decide</code>)</td><td>yes</td><td>yes (same wire format)</td></tr>
+          <tr><td>Async execution, retries, cross-model failover</td><td>yes</td><td>drive your own client from <code>decide()</code></td></tr>
+          <tr><td>Provider adapters + usage-counter learning</td><td>yes (Anthropic, OpenAI-compatible)</td><td>roadmap</td></tr>
+          <tr><td>Lead/sidekick delegation with pair economics</td><td>yes</td><td>roadmap</td></tr>
+          <tr><td>Runtime dependencies</td><td>0 (httpx optional)</td><td>0</td></tr>
+          <tr><td>License</td><td>Apache-2.0</td><td>Apache-2.0</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <aside class="callout">
+      <h3>Honest expectations</h3>
+      <p>Budget <strong>30&ndash;40% cost reduction at &le;2% quality loss</strong>. Numbers like 85% come from
+      easy benchmarks and input-only cost accounting. The savings arithmetic that actually matters:
+      if your strong/weak price gap is under about 3&times;, routing cannot pay for itself. Ship the
+      <code>eval</code> command and measure your own traffic.</p>
+    </aside>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="container footer-inner">
+    <span>llmrouter &middot; Apache-2.0</span>
+    <span class="footer-note">Formulas verified against primary provider docs, 2026-09-12. Prices go stale; the multipliers are the verified part.</span>
+  </div>
+</footer>
+
+<script src="script.js" defer></script>
+<script type="module" src="demo.js"></script>
+</body>
+</html>
