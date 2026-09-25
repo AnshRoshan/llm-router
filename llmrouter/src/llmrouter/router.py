@@ -266,9 +266,40 @@ class Router:
         know and we do not.
         """
         prices = PriceRegistry()
-        backends: list[BackendSpec] = []
+        backends: list[BackendSpec] = cls._cloud_backends(prices, anthropic_key, openai_key)
+        backends.extend(extra_backends)
+        if not backends:
+            raise ValueError(
+                "no backends configured — pass anthropic_key/openai_key or extra_backends"
+            )
+
+        router = cls(
+            prices=prices,
+            backends=BackendRegistry(backends),
+            resolver=WorkloadResolver(
+                profiles=profiles,
+                classifier=classifier,
+                default_workload=default_workload,
+            ),
+            config=config,
+            transport=transport,
+            sidekick_model=sidekick_model,
+            lead_model=lead_model,
+            delegation=delegation,
+            pairs=pairs,
+            quality_model=quality_model,
+            state_store=state_store,
+        )
+        router._keys = {"anthropic": anthropic_key, "openai": openai_key}  # type: ignore[attr-defined]
+        return router
+
+    @staticmethod
+    def _cloud_backends(prices: PriceRegistry,
+                        anthropic_key: str | None,
+                        openai_key: str | None) -> list[BackendSpec]:
+        out: list[BackendSpec] = []
         if anthropic_key:
-            backends.append(BackendSpec(
+            out.append(BackendSpec(
                 backend_id="anthropic",
                 deployment=DeploymentClass.API,
                 models=tuple(m for m in prices.ids() if m.startswith("claude")),
@@ -276,18 +307,72 @@ class Router:
                 priority=0,
             ))
         if openai_key:
-            backends.append(BackendSpec(
+            out.append(BackendSpec(
                 backend_id="openai",
                 deployment=DeploymentClass.API,
                 models=tuple(m for m in prices.ids() if m.startswith("gpt")),
                 base_url="https://api.openai.com",
                 priority=1,
             ))
-        backends.extend(extra_backends)
-        if not backends:
+        return out
+
+    @classmethod
+    def with_ollama(
+        cls,
+        *,
+        base_url: str = "http://localhost:11434",
+        models: Sequence[str] | None = None,
+        gpu_cost_per_hr: float = 0.35,
+        tokens_per_sec: float = 35.0,
+        local_quality: float = 0.72,
+        per_model: Mapping[str, Mapping[str, float]] | None = None,
+        capacity_rps: float = 2.0,
+        anthropic_key: str | None = None,
+        openai_key: str | None = None,
+        profiles: Mapping[str, AgentProfile] | None = None,
+        classifier: WorkloadClassifier | None = None,
+        default_workload: WorkloadClass = WorkloadClass.CHAT,
+        config: RouterConfig | None = None,
+        transport: Any | None = None,
+        sidekick_model: str | None = None,
+        lead_model: str | None = None,
+        delegation: DelegationPolicy | None = None,
+        pairs: PairRegistry | None = None,
+        quality_model: QualityModel | None = None,
+        state_store: FileStateStore | None = None,
+    ) -> "Router":
+        """A local-first fleet: your Ollama models AND the cloud, one score.
+
+        `models=None` discovers what is installed (GET /api/tags) at build
+        time — the decision layer itself stays pure and offline. Each local
+        model gets a price card whose $/MTok is derived from the GPU hourly
+        rent and decode throughput (see llmrouter.local), so cheap-and-close
+        beats expensive-and-frontier exactly when the arithmetic says so, and
+        fails over the other way when the GPU saturates.
+
+        Pass `anthropic_key`/`openai_key` to mix cloud capacity into the same
+        candidate pool — the routing decision then spans llama-on-my-laptop and
+        the frontier API on one score line.
+        """
+        from .local import (
+            ollama_backend, ollama_models as _discover, ollama_price_cards,
+        )
+        names = tuple(models) if models is not None else _discover(base_url)
+        if not names:
             raise ValueError(
-                "no backends configured — pass anthropic_key/openai_key or extra_backends"
+                f"no local models found at {base_url!r} — start Ollama, pull a "
+                "model, or pass models=[...] explicitly"
             )
+        prices = PriceRegistry()  # bundled cloud cards stay registered; a card
+        # with no healthy backend is simply never a candidate.
+        prices.register_many(ollama_price_cards(
+            names, gpu_cost_per_hr=gpu_cost_per_hr,
+            tokens_per_sec=tokens_per_sec, quality=local_quality,
+            per_model=per_model,
+        ))
+        backends = [ollama_backend(names, base_url=base_url,
+                                   capacity_rps=capacity_rps)]
+        backends.extend(cls._cloud_backends(prices, anthropic_key, openai_key))
 
         router = cls(
             prices=prices,

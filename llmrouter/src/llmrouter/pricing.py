@@ -228,6 +228,10 @@ class PriceRegistry:
     def register(self, card: PriceCard) -> None:
         self._cards[card.model_id] = card
 
+    def register_many(self, cards: Mapping[str, PriceCard]) -> None:
+        """Bulk registration (local fleets, generated catalogs)."""
+        self._cards.update(cards)
+
     def unregister(self, model_id: str) -> None:
         self._cards.pop(model_id, None)
 

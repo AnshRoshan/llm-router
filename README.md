@@ -31,6 +31,9 @@ python -m llmrouter eval --data cases.jsonl --ci --quality-model quality.json
 # decision sidecar for LiteLLM / Bifrost / your own proxy (both runtimes)
 python -m llmrouter serve --port 8787        # POST /decide
 npx llmrouter serve --port 8787              # same wire format
+
+# local GPU + cloud scored together, with honest $/MTok GPU economics
+python -c "from llmrouter import Router; Router.with_ollama(openai_key='...')"
 ```
 
 The Python engine also **streams** (`router.astream`, failover safe before the

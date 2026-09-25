@@ -409,6 +409,35 @@ bearer auth, `--state` to keep affinity durable, and a following request's
 `observed_usage` feeds the provider counters back into the learned hit rate —
 decide with us, execute wherever.
 
+## The laptop is a backend: Ollama and self-hosted fleets
+
+`Router.with_ollama()` puts your local models and the cloud on **one score
+line**. Model discovery happens at build time (`GET /api/tags`); the decision
+layer stays pure and offline.
+
+```python
+router = Router.with_ollama(
+    openai_key="sk-...",                    # mix cloud capacity in (optional)
+    per_model={"qwen2.5-coder:32b": {"quality": 0.86, "supports_tools": True,
+                                     "tokens_per_sec": 9.0, "gpu_cost_per_hr": 1.80}},
+)
+```
+
+The economics are honest, not "local is free": each model gets a price card
+whose $/MTok is derived from the GPU's hourly rent and its decode throughput
+($0.35/hr at 35 tok/s → $2.78/MTok output — cheaper than gpt-mini's $3; a
+$1.80/hr box at 140 tok/s → $3.57, and it loses). Prefill is priced 6× cheaper
+than decode, matching how the hardware actually behaves.
+
+Operational rules baked in: an **8-second timeout** (a saturated GPU that
+queues is the cascade trap — everything tips to cloud at 100× the cost at
+once), `capacity_rps` shedding, and the normal circuit breaker — when the
+laptop saturates, traffic fails over to the API automatically, and drains
+back when it recovers. A text-only local model is *excluded* from vision
+traffic by the hard constraints, not merely scored low. vLLM/SGLang learn
+hit rates properly (`cached_tokens` counters); Ollama's OpenAI shim reports
+no cache counters, so those sessions lean on the workload priors.
+
 ## Other runtimes
 
 The decision engine is also available for Node.js: [`npm/llmrouter`](../npm/llmrouter)

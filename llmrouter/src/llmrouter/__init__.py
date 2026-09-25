@@ -96,6 +96,13 @@ from .learning import (
     load_feedback,
     train_heads,
 )
+from .local import (
+    OLLAMA_DEFAULT_URL,
+    gpu_price_card,
+    ollama_backend,
+    ollama_models,
+    ollama_price_cards,
+)
 from .policy import PolicyEngine, RouterConfig, Weights
 from .pricing import (
     ANTHROPIC_CACHE,
@@ -129,7 +136,7 @@ from .types import (
     WorkloadSource,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -226,4 +233,10 @@ __all__ = [
     "FileStateStore",
     "take_snapshot",
     "restore_snapshot",
+    # local / self-hosted
+    "OLLAMA_DEFAULT_URL",
+    "gpu_price_card",
+    "ollama_models",
+    "ollama_backend",
+    "ollama_price_cards",
 ]
