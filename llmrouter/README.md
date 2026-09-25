@@ -85,30 +85,40 @@ await router.acomplete(msgs, agent_profile="triage")
    [Laya](https://github.com/NandhaKishorM/laya) — see below.
 4. **default** — never fails to route; logged as `default` so it stays auditable.
 
-### B3, implemented: `LayaWorkloadClassifier`
+### B3, implemented: a classifier family you can order
 
-[Laya](https://github.com/NandhaKishorM/laya) is a local typed-decision
-classifier: ~33 ms per question in a single non-autoregressive forward pass —
-no text generation, so nothing to parse and nothing to hallucinate, and its
-calibration is trained against proper scoring rules (exactly what a
-confidence you route with should mean). This router ships the adapter:
+The hook ships with adapters for the whole "System 1" classifier family —
+small encoder models that answer a `choice` question in one forward pass
+(no generation, nothing to hallucinate, calibration trained against proper
+scoring rules):
+
+| Adapter | Backed by | Where it runs | Notes |
+|---|---|---|---|
+| `LayaWorkloadClassifier` | [Laya](https://github.com/NandhaKishorM/laya) (421M) **or any server on the typed-decision `/predict` contract — including Codiv-hosted Verdict** | HTTP, stdlib-only | ~33 ms; `question_key` configurable |
+| `GLiClassWorkloadClassifier` | [GLiClass](https://github.com/Knowledgator/GLiClass) (ModernBERT zero-shot, the backbone family) | in-process, **optional** `pip install gliclass` | abstains cleanly if the extra is missing |
+| `CallableWorkloadClassifier` | anything: SetFit, fastText, your sklearn head, a hash map | in-process | fn returns `label` or `(label, confidence)` |
+| `ChainWorkloadClassifier([...])` | all of the above | in order | first non-abstention wins; a crashed link never kills the chain |
+
+The model race, for the record: openJev-verdict-2.0 (151M, RLCD-calibrated,
+~20–25 ms) reports 77.10% top-1 on `LocalLLaMA/typed-decisions` vs Laya's
+76.60% at 2.8× fewer parameters — but they answer the same schema, which is
+exactly why the chain is the right abstraction: **model choice becomes an
+ordering decision, never a code change.**
 
 ```python
-from llmrouter import LayaWorkloadClassifier, Router
+from llmrouter import (Router, ChainWorkloadClassifier,
+                       GLiClassWorkloadClassifier, LayaWorkloadClassifier)
 
-router = Router.with_ollama(          # or with_defaults / pure(...)
-    classifier=LayaWorkloadClassifier("http://127.0.0.1:8000/predict"),
-    ...
-)
+router = Router.with_ollama(classifier=ChainWorkloadClassifier([
+    GLiClassWorkloadClassifier(),                                 # ~5 ms in-proc
+    LayaWorkloadClassifier("http://127.0.0.1:8000/predict"),      # ~33 ms server
+]))
 ```
 
-Design rules the adapter honors: one `choice` question over the six workload
-classes via Laya's documented FastAPI `POST /predict` contract; stdlib
-`urllib` only (Laya's torch stack stays in *its* process, so the
-zero-dependency rule holds here); a 2 s timeout and confidence floor — and
-**any** failure returns `None`, which just means B3 abstains and the
-fingerprint/default paths carry on. A classifier is an upgrade, never a
-dependency.
+Design rules every adapter honors: stdlib-only core (torch stays in the
+user's process or the classifier's), a timeout, a confidence floor, and
+**any** failure returns `None` — B3 abstains and the fingerprint/default
+paths carry on. An upgrade, never a dependency.
 
 ## What makes it different
 

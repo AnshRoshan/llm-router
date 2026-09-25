@@ -129,3 +129,102 @@ def test_router_construction_accepts_the_classifier():
     c = LayaWorkloadClassifier()
     router = Router.pure(classifier=c)
     assert router.resolver.classifier is c
+
+
+# --------------------------------------------------------------------------- #
+# in-process family: callable wrapper, GLiClass, chain
+# --------------------------------------------------------------------------- #
+def _req(text="hello there buddy"):
+    return RoutingRequest(messages=(Message("user", text),))
+
+
+def test_callable_classifier_label_tuple_and_none():
+    from llmrouter import CallableWorkloadClassifier
+    clf = CallableWorkloadClassifier(lambda t: "code", name="head")
+    sig = clf.classify(_req())
+    assert sig.workload == WorkloadClass.CODE
+    assert "head: code" in sig.reason
+
+    clf2 = CallableWorkloadClassifier(lambda t: ("rag", 0.4))
+    assert clf2.classify(_req()).confidence == pytest.approx(0.4)
+    assert CallableWorkloadClassifier(lambda t: ("rag", 0.1)).classify(_req()) is None
+    assert CallableWorkloadClassifier(lambda t: None).classify(_req()) is None
+    assert CallableWorkloadClassifier(lambda t: "nonsense").classify(_req()) is None
+
+    def boom(_):
+        raise RuntimeError("model on fire")
+    assert CallableWorkloadClassifier(boom).classify(_req()) is None
+
+
+def test_gliclass_abstains_cleanly_when_package_missing():
+    # gliclass is an OPTIONAL user-side install; with it absent the adapter
+    # must abstain, not ImportError, so routing keeps working.
+    from llmrouter import GLiClassWorkloadClassifier
+    clf = GLiClassWorkloadClassifier()
+    try:
+        import gliclass  # noqa: F401
+        pytest.skip("gliclass installed — abstention path not reachable")
+    except ImportError:
+        pass
+    assert clf.classify(_req()) is None
+    assert clf._import_failed is True
+
+
+def test_gliclass_parses_pipeline_scores(monkeypatch):
+    from llmrouter import GLiClassWorkloadClassifier
+
+    class FakePipe:
+        def run(self, text, labels):
+            return [{"agent": 0.05, "code": 0.72, "chat": 0.1,
+                     "rag": 0.03, "batch": 0.05, "vision": 0.05}]
+
+    clf = GLiClassWorkloadClassifier()
+    monkeypatch.setattr(clf, "_get_pipeline", lambda: FakePipe())
+    sig = clf.classify(_req())
+    assert sig.workload == WorkloadClass.CODE
+    assert sig.confidence == pytest.approx(0.72)
+    assert "gliclass" in sig.reason
+
+
+def test_chain_first_non_abstention_wins():
+    from llmrouter import CallableWorkloadClassifier, ChainWorkloadClassifier
+
+    order = []
+    first = CallableWorkloadClassifier(
+        lambda t: order.append("first") or None, name="a")
+    second = CallableWorkloadClassifier(
+        lambda t: order.append("second") or ("batch", 0.9), name="b")
+    third = CallableWorkloadClassifier(
+        lambda t: order.append("third") or ("chat", 0.9), name="c")
+    chain = ChainWorkloadClassifier([first, second, third])
+    sig = chain.classify(_req())
+    assert sig.workload == WorkloadClass.BATCH
+    assert order == ["first", "second"]   # third never consulted
+
+    # a crashing link does not kill the chain
+    bad = CallableWorkloadClassifier(
+        lambda t: (_ for _ in ()).throw(ValueError("nope")))
+    good = CallableWorkloadClassifier(lambda t: ("agent", 0.8))
+    sig2 = ChainWorkloadClassifier([bad, good]).classify(_req())
+    assert sig2.workload == WorkloadClass.AGENT
+    assert ChainWorkloadClassifier([bad]).classify(_req()) is None
+
+
+def test_chain_with_laya_http_link_and_local_fallback(classifier):
+    from llmrouter import CallableWorkloadClassifier, ChainWorkloadClassifier
+    laya, fake = classifier(_body("vision", probability=0.8))
+    fake.error = OSError("server down")  # link 1 abstains
+    fallback = CallableWorkloadClassifier(lambda t: ("code", 0.6), name="fn")
+    sig = ChainWorkloadClassifier([laya, fallback]).classify(_req())
+    assert sig.workload == WorkloadClass.CODE
+    assert "fn: code" in sig.reason
+
+
+def test_chain_wired_through_the_resolver(classifier):
+    from llmrouter import CallableWorkloadClassifier, ChainWorkloadClassifier
+    c, _ = classifier(_body("agent", probability=0.9))
+    resolver = WorkloadResolver(classifier=ChainWorkloadClassifier([
+        CallableWorkloadClassifier(lambda t: None), c]))
+    sig = resolver.resolve(_req())
+    assert sig.source == WorkloadSource.CLASSIFIER
+    assert sig.workload == WorkloadClass.AGENT

@@ -65,11 +65,16 @@ class LayaWorkloadClassifier:
 
     def __init__(self, endpoint: str = DEFAULT_LAYA_URL,
                  timeout_s: float = 2.0,
-                 confidence_floor: float = 0.35) -> None:
+                 confidence_floor: float = 0.35,
+                 question_key: str = "workload") -> None:
         self.endpoint = endpoint
         self.timeout_s = timeout_s
         #: Below this the choice is noise — abstain and let the priors work.
         self.confidence_floor = confidence_floor
+        #: The question name in the typed-decision payload. Codiv-hosted
+        #: Verdict (rlcd-modernbert-151m / openJev) answers the same contract
+        #: as Laya; any server conforming to it works with this adapter.
+        self.question_key = question_key
 
     # ---- the protocol ---------------------------------------------------- #
     def classify(self, request: RoutingRequest) -> WorkloadSignal | None:
@@ -97,7 +102,7 @@ class LayaWorkloadClassifier:
         payload = {
             "state": {"body": text},
             "questions": {
-                "workload": {
+                self.question_key: {
                     "type": "choice",
                     "instructions": "Which single category best describes "
                                     "what this request needs?",
@@ -118,9 +123,8 @@ class LayaWorkloadClassifier:
             return None
         return self._parse(body)
 
-    @staticmethod
-    def _parse(body: Mapping[str, Any]) -> tuple[str, float] | None:
-        ans = ((body.get("answers") or {}).get("workload") or {})
+    def _parse(self, body: Mapping[str, Any]) -> tuple[str, float] | None:
+        ans = ((body.get("answers") or {}).get(self.question_key) or {})
         choice = ans.get("choice")
         if not isinstance(choice, str):
             return None
@@ -139,4 +143,169 @@ class LayaWorkloadClassifier:
         return choice, (0.8 if confidence is None else confidence)
 
 
-__all__ = ["LayaWorkloadClassifier", "DEFAULT_LAYA_URL", "WORKLOAD_CRITERIA"]
+# --------------------------------------------------------------------------- #
+# In-process adapters: bring your own model
+# --------------------------------------------------------------------------- #
+LabelFn = Any  # Callable[[str], str | tuple[str, float] | None]
+
+
+class CallableWorkloadClassifier:
+    """Wrap any in-process text→label function as a B3 classifier.
+
+    The escape hatch for models that prefer to run inside your process —
+    SetFit, fastText, a scikit-learn head, a hash lookup, anything::
+
+        from sentence_transformers import SentenceTransformer
+        from setfit import SetFitModel
+        model = SetFitModel.from_pretrained("me/workload-head")
+        clf = CallableWorkloadClassifier(lambda text: model(text))
+
+    The function may return:
+      * a label string (confidence = ``default_confidence``)
+      * a ``(label, confidence)`` tuple
+      * ``None`` to abstain
+    Exceptions are caught: a broken classifier must never break routing.
+    """
+
+    def __init__(self, fn: LabelFn, *, name: str = "callable",
+                 default_confidence: float = 0.7,
+                 confidence_floor: float = 0.35) -> None:
+        self.fn = fn
+        self.name = name
+        self.default_confidence = default_confidence
+        self.confidence_floor = confidence_floor
+
+    def classify(self, request: RoutingRequest) -> WorkloadSignal | None:
+        text = request.first_user_text() or "\n".join(
+            m.text for m in request.messages)
+        if not text.strip():
+            return None
+        try:
+            out = self.fn(text)
+        except Exception:  # noqa: BLE001 — abstention, never break routing
+            return None
+        confidence = self.default_confidence
+        if isinstance(out, tuple):
+            if len(out) != 2:
+                return None
+            choice, confidence = out[0], float(out[1])
+        else:
+            choice = out
+        if not isinstance(choice, str):
+            return None
+        try:
+            workload = WorkloadClass(choice)
+        except ValueError:
+            return None
+        if confidence < self.confidence_floor:
+            return None
+        return WorkloadSignal(
+            workload, WorkloadSource.CLASSIFIER, confidence,
+            f"{self.name}: {choice}",
+        )
+
+
+class GLiClassWorkloadClassifier:
+    """Zero-shot in-process classification via GLiClass (optional extra).
+
+    GLiClass (Knowledgator) is the encoder family that backs the typed-decision
+    models — a ModernBERT zero-shot head, single forward pass, ~10x faster than
+    cross-encoders. Requires the user-side install ``pip install gliclass``
+    (torch &co stay OUT of llmrouter's dependency graph; this adapter imports
+    lazily and abstains cleanly when the package or model is missing).
+
+    ::
+
+        clf = GLiClassWorkloadClassifier("knowledgator/gliclass-small-v1.0")
+    """
+
+    def __init__(self, model_id: str = "knowledgator/gliclass-small-v1.0",
+                 *, device: str | None = None,
+                 confidence_floor: float = 0.35) -> None:
+        self.model_id = model_id
+        self.device = device
+        self.confidence_floor = confidence_floor
+        self._pipeline = None
+        self._import_failed = False
+
+    def _get_pipeline(self):
+        if self._pipeline is not None or self._import_failed:
+            return self._pipeline
+        try:
+            from gliclass import GLiClassModel, ZeroShotClassificationPipeline  # type: ignore
+            from transformers import AutoTokenizer  # type: ignore
+        except ImportError:
+            self._import_failed = True
+            return None
+        model = GLiClassModel.from_pretrained(self.model_id)
+        tok = AutoTokenizer.from_pretrained(self.model_id)
+        self._pipeline = ZeroShotClassificationPipeline(
+            model, tok, classification_type="single-label",
+            device=self.device,
+        )
+        return self._pipeline
+
+    def classify(self, request: RoutingRequest) -> WorkloadSignal | None:
+        pipe = self._get_pipeline()
+        if pipe is None:
+            return None
+        text = request.first_user_text() or "\n".join(
+            m.text for m in request.messages)
+        if not text.strip():
+            return None
+        labels = list(WORKLOAD_CRITERIA)
+        try:
+            scores = pipe.run(text, labels)
+        except Exception:  # noqa: BLE001 — abstention, never a crash
+            return None
+        # GLiClass returns per-text {label: score} dicts (or a list thereof).
+        if isinstance(scores, list):
+            scores = scores[0] if scores else {}
+        if not isinstance(scores, Mapping):
+            return None
+        best, conf = None, -1.0
+        for label, value in scores.items():
+            if isinstance(value, (int, float)) and value > conf:
+                best, conf = str(label), float(value)
+        if best is None or best not in WorkloadClass.__members__.values():
+            return None
+        if conf < self.confidence_floor:
+            return None
+        return WorkloadSignal(
+            WorkloadClass(best), WorkloadSource.CLASSIFIER, conf,
+            f"gliclass {self.model_id.split('/')[-1]}: {best}",
+        )
+
+
+class ChainWorkloadClassifier:
+    """Try classifiers in order; the first non-abstention wins.
+
+    The 'whichever they want, whenever they want' answer: order is a policy,
+    not a code change — cheap local head first, server model as backup, an LLM
+    judge as last resort (or any permutation)::
+
+        classifier=ChainWorkloadClassifier([
+            GLiClassWorkloadClassifier(),                      # ~5 ms, in-proc
+            LayaWorkloadClassifier("http://127.0.0.1:8000/predict"),  # ~33 ms
+        ])
+    """
+
+    def __init__(self, classifiers: list) -> None:
+        self.classifiers = list(classifiers)
+
+    def classify(self, request: RoutingRequest) -> WorkloadSignal | None:
+        for clf in self.classifiers:
+            try:
+                sig = clf.classify(request)
+            except Exception:  # noqa: BLE001 — one bad link must not kill the chain
+                continue
+            if sig is not None:
+                return sig
+        return None
+
+
+__all__ = [
+    "LayaWorkloadClassifier", "DEFAULT_LAYA_URL", "WORKLOAD_CRITERIA",
+    "CallableWorkloadClassifier", "GLiClassWorkloadClassifier",
+    "ChainWorkloadClassifier",
+]

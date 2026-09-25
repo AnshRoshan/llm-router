@@ -337,11 +337,14 @@ conversation history       &rarr; 5m</pre>
       <article class="card">
         <h3>Turn-1 inference you can afford</h3>
         <p>When structural rules and the prompt fingerprint both abstain, the classifier hook (path B3)
-        may ask a small model &mdash; once, on turn 1, amortized over the session.
-        <code>LayaWorkloadClassifier</code> plugs in <a href="https://github.com/NandhaKishorM/laya">Laya</a>,
-        a local typed-decision classifier: ~33 ms, no text generation, nothing to hallucinate, calibration
-        trained against proper scoring rules. Stdlib HTTP only, and any failure is a clean abstention
-        &mdash; an upgrade, never a dependency.</p>
+        may ask a small &ldquo;System&nbsp;1&rdquo; model &mdash; once, on turn 1, amortized over the session.
+        Four adapters ship: <code>LayaWorkloadClassifier</code> (HTTP, also speaks for Codiv-hosted
+        <a href="https://github.com/Heman10x-NGU/openJev-verdict-2.0">Verdict/openJev</a> &mdash; 151M,
+        RLCD-calibrated, ~20&nbsp;ms), <code>GLiClassWorkloadClassifier</code> (in-process zero-shot),
+        <code>CallableWorkloadClassifier</code> (SetFit, fastText, anything), and
+        <code>ChainWorkloadClassifier</code> so model choice is an ordering, not a code change.
+        Single forward pass means nothing to parse and nothing to hallucinate; any failure is a clean
+        abstention &mdash; an upgrade, never a dependency.</p>
       </article>
     </div>
   </div>

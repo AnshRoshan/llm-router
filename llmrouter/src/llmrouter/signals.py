@@ -8,6 +8,7 @@ PATH B (inferred) — the caller declared nothing.
     B1 structural rules   ~0 ms, free, resolves most production traffic
     B2 prompt fingerprint ~0 ms, exact, once per *application*
     B3 classifier hook    only when B1/B2 abstain; turn 1 only
+                          (ready implementations in llmrouter.classifiers)
     B4 workload default   never fail to route; logged as 'default'
 
 The economics that justify B3: the decision cost is paid ONCE and amortized over

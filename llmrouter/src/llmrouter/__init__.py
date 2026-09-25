@@ -96,7 +96,13 @@ from .learning import (
     load_feedback,
     train_heads,
 )
-from .classifiers import DEFAULT_LAYA_URL, LayaWorkloadClassifier
+from .classifiers import (
+    CallableWorkloadClassifier,
+    ChainWorkloadClassifier,
+    DEFAULT_LAYA_URL,
+    GLiClassWorkloadClassifier,
+    LayaWorkloadClassifier,
+)
 from .local import (
     OLLAMA_DEFAULT_URL,
     gpu_price_card,
@@ -233,6 +239,9 @@ __all__ = [
     # classifiers (Path B3)
     "LayaWorkloadClassifier",
     "DEFAULT_LAYA_URL",
+    "CallableWorkloadClassifier",
+    "GLiClassWorkloadClassifier",
+    "ChainWorkloadClassifier",
     # state
     "FileStateStore",
     "take_snapshot",
