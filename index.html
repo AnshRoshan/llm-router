@@ -237,7 +237,7 @@ TEST CARDS (QA-007): For sandbox verification use 4000000000000002 (declined), 4
 <section id="concepts" class="section">
   <div class="container">
     <h2>What makes it different</h2>
-    <p class="section-sub">Ten ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
+    <p class="section-sub">Eleven ideas, each enforced in code and pinned by paired tests in both runtimes.</p>
 
     <div class="grid">
       <article class="card">
@@ -324,6 +324,15 @@ conversation history       &rarr; 5m</pre>
         Decide with us, execute wherever, and feed the provider counters back on the next request so
         the learned hit rate survives the boundary.</p>
       </article>
+
+      <article class="card">
+        <h3>The laptop is a backend</h3>
+        <p><code>Router.with_ollama()</code> puts local models and the cloud on one score line, with
+        honest GPU economics: <code>$/MTok = gpu_rent / (tok_per_s &times; 3600) &times; 10&#8316;</code>.
+        A $0.35/hr box at 35 tok/s costs $2.78/MTok &mdash; it beats or loses to gpt-mini on arithmetic,
+        not vibes. An 8-second timeout plus <code>capacity_rps</code> shedding exist to beat the cascade
+        trap, and traffic fails over to the API when the GPU saturates, then drains back.</p>
+      </article>
     </div>
   </div>
 </section>
@@ -382,6 +391,7 @@ npx llmrouter serve --port 8787</code></pre>
           <tr><td>Learned quality heads (train offline, infer in both runtimes)</td><td>train + infer</td><td>infer (same checkpoint)</td></tr>
           <tr><td>Durable state (<code>llmrouter-state-v1</code> snapshots)</td><td>yes</td><td>yes (same format)</td></tr>
           <tr><td>HTTP decide-sidecar (<code>POST /decide</code>)</td><td>yes</td><td>yes (same wire format)</td></tr>
+          <tr><td>Local fleets (<code>Router.with_ollama</code>, GPU-hour &rarr; $/MTok cards)</td><td>yes</td><td>register the same cards via <code>PriceRegistry</code></td></tr>
           <tr><td>Async execution, retries, cross-model failover</td><td>yes</td><td>drive your own client from <code>decide()</code></td></tr>
           <tr><td>Provider adapters + usage-counter learning</td><td>yes (Anthropic, OpenAI-compatible)</td><td>roadmap</td></tr>
           <tr><td>Lead/sidekick delegation with pair economics</td><td>yes</td><td>roadmap</td></tr>
