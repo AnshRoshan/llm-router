@@ -36,6 +36,16 @@
     "cost-optimization",
     "ai"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnshRoshan/llm-router.git",
+    "directory": "npm/llmrouter"
+  },
+  "homepage": "https://anshroshan.github.io/llm-router/",
+  "bugs": {
+    "url": "https://github.com/AnshRoshan/llm-router/issues"
+  },
+  "author": "llmrouter contributors",
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.28.2",

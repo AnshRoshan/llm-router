@@ -32,7 +32,10 @@ http = ["httpx>=0.27"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
 
 [project.urls]
-Homepage = "https://github.com/example/llmrouter"
+Homepage = "https://anshroshan.github.io/llm-router/"
+Repository = "https://github.com/AnshRoshan/llm-router"
+Documentation = "https://anshroshan.github.io/llm-router/"
+Issues = "https://github.com/AnshRoshan/llm-router/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
